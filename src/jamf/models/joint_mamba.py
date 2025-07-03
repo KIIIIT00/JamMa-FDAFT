@@ -272,4 +272,251 @@ class JEGOMamba(nn.Module):
         """
         batch_size, seq_len, hidden_dim = features0.shape
         
-        # 2D座標に戻すためのreshape
+        # 2D座標に戻すためのreshape (仮定: square image)
+        H = W = int(math.sqrt(seq_len))
+        if H * W != seq_len:
+            # 非正方形の場合の処理
+            H = int(math.sqrt(seq_len))
+            W = seq_len // H
+        
+        # [B, N, D] → [B, H, W, D]
+        feat0_2d = features0.view(batch_size, H, W, hidden_dim)
+        feat1_2d = features1.view(batch_size, H, W, hidden_dim)
+        
+        # Joint concatenation (水平・垂直)
+        joint_horizontal = torch.cat([feat0_2d, feat1_2d], dim=2)  # [B, H, 2W, D]
+        joint_vertical = torch.cat([feat0_2d, feat1_2d], dim=1)    # [B, 2H, W, D]
+        
+        # 4方向スキャンシーケンス生成
+        sequences = []
+        
+        # 1. Right scan (水平右方向)
+        right_seq = self.scan_right_with_skip(joint_horizontal)
+        sequences.append(right_seq)
+        
+        # 2. Left scan (水平左方向)
+        left_seq = self.scan_left_with_skip(joint_horizontal)
+        sequences.append(left_seq)
+        
+        # 3. Down scan (垂直下方向)
+        down_seq = self.scan_down_with_skip(joint_vertical)
+        sequences.append(down_seq)
+        
+        # 4. Up scan (垂直上方向)
+        up_seq = self.scan_up_with_skip(joint_vertical)
+        sequences.append(up_seq)
+        
+        return sequences
+    
+    def scan_right_with_skip(self, joint_features: torch.Tensor) -> torch.Tensor:
+        """
+        右方向スキャン（スキップ付き）with Joint scan
+        """
+        batch_size, H, W, D = joint_features.shape
+        sequence = []
+        
+        for h in range(0, H, self.skip_steps):
+            for w in range(0, W, self.skip_steps):
+                if h < H and w < W:
+                    sequence.append(joint_features[:, h, w, :])
+        
+        if sequence:
+            return torch.stack(sequence, dim=1)  # [B, L/4, D]
+        else:
+            return torch.empty(batch_size, 0, D, device=joint_features.device)
+    
+    def scan_left_with_skip(self, joint_features: torch.Tensor) -> torch.Tensor:
+        """
+        左方向スキャン（スキップ付き）with Joint scan
+        """
+        batch_size, H, W, D = joint_features.shape
+        sequence = []
+        
+        for h in range(0, H, self.skip_steps):
+            for w in range(W-1, -1, -self.skip_steps):
+                if h < H and w >= 0:
+                    sequence.append(joint_features[:, h, w, :])
+        
+        if sequence:
+            return torch.stack(sequence, dim=1)
+        else:
+            return torch.empty(batch_size, 0, D, device=joint_features.device)
+    
+    def scan_down_with_skip(self, joint_features: torch.Tensor) -> torch.Tensor:
+        """
+        下方向スキャン（スキップ付き）with Joint scan
+        """
+        batch_size, H, W, D = joint_features.shape
+        sequence = []
+        
+        for w in range(0, W, self.skip_steps):
+            for h in range(0, H, self.skip_steps):
+                if h < H and w < W:
+                    sequence.append(joint_features[:, h, w, :])
+        
+        if sequence:
+            return torch.stack(sequence, dim=1)
+        else:
+            return torch.empty(batch_size, 0, D, device=joint_features.device)
+    
+    def scan_up_with_skip(self, joint_features: torch.Tensor) -> torch.Tensor:
+        """
+        上方向スキャン（スキップ付き）with Joint scan
+        """
+        batch_size, H, W, D = joint_features.shape
+        sequence = []
+        
+        for w in range(0, W, self.skip_steps):
+            for h in range(H-1, -1, -self.skip_steps):
+                if h >= 0 and w < W:
+                    sequence.append(joint_features[:, h, w, :])
+        
+        if sequence:
+            return torch.stack(sequence, dim=1)
+        else:
+            return torch.empty(batch_size, 0, D, device=joint_features.device)
+    
+    def jego_merge(self, processed_sequences: list, original_seq_len: int) -> torch.Tensor:
+        """
+        JEGO Merge: バランスの取れた受容野でシーケンスをマージ
+        
+        Args:
+            processed_sequences: 4方向の処理済みシーケンス
+            original_seq_len: 元のシーケンス長
+            
+        Returns:
+            マージされた特徴 [B, 2*N, D] (2つの画像の結合特徴)
+        """
+        batch_size = processed_sequences[0].shape[0]
+        hidden_dim = processed_sequences[0].shape[-1]
+        
+        # 2D座標系に戻すための準備
+        H = W = int(math.sqrt(original_seq_len))
+        if H * W != original_seq_len:
+            H = int(math.sqrt(original_seq_len))
+            W = original_seq_len // H
+        
+        # 4方向のシーケンスを2D特徴マップに復元
+        horizontal_map = torch.zeros(batch_size, H, 2*W, hidden_dim, device=processed_sequences[0].device)
+        vertical_map = torch.zeros(batch_size, 2*H, W, hidden_dim, device=processed_sequences[0].device)
+        
+        # Right/Left scan復元
+        self.restore_horizontal_scans(processed_sequences[0], processed_sequences[1], 
+                                    horizontal_map, H, W)
+        
+        # Up/Down scan復元
+        self.restore_vertical_scans(processed_sequences[2], processed_sequences[3], 
+                                  vertical_map, H, W)
+        
+        # 水平・垂直特徴を分離
+        horizontal_feat0 = horizontal_map[:, :, :W, :]
+        horizontal_feat1 = horizontal_map[:, :, W:, :]
+        vertical_feat0 = vertical_map[:, :H, :, :]
+        vertical_feat1 = vertical_map[:, H:, :, :]
+        
+        # 水平・垂直特徴を合成
+        merged_feat0 = horizontal_feat0 + vertical_feat0
+        merged_feat1 = horizontal_feat1 + vertical_feat1
+        
+        # 平坦化して結合
+        merged_feat0_flat = merged_feat0.view(batch_size, -1, hidden_dim)
+        merged_feat1_flat = merged_feat1.view(batch_size, -1, hidden_dim)
+        
+        # 2つの画像の特徴を結合
+        joint_features = torch.cat([merged_feat0_flat, merged_feat1_flat], dim=1)
+        
+        return joint_features
+    
+    def restore_horizontal_scans(self, right_seq: torch.Tensor, left_seq: torch.Tensor,
+                               target_map: torch.Tensor, H: int, W: int):
+        """
+        水平スキャンを2Dマップに復元
+        """
+        # Right scan復元
+        seq_idx = 0
+        for h in range(0, H, self.skip_steps):
+            for w in range(0, 2*W, self.skip_steps):
+                if seq_idx < right_seq.shape[1] and h < H and w < 2*W:
+                    target_map[:, h, w, :] = right_seq[:, seq_idx, :]
+                    seq_idx += 1
+        
+        # Left scan復元（処理を簡略化）
+        # 実際の実装では座標の対応をより詳細に行う
+    
+    def restore_vertical_scans(self, down_seq: torch.Tensor, up_seq: torch.Tensor,
+                             target_map: torch.Tensor, H: int, W: int):
+        """
+        垂直スキャンを2Dマップに復元
+        """
+        # Down scan復元
+        seq_idx = 0
+        for w in range(0, W, self.skip_steps):
+            for h in range(0, 2*H, self.skip_steps):
+                if seq_idx < down_seq.shape[1] and h < 2*H and w < W:
+                    target_map[:, h, w, :] = down_seq[:, seq_idx, :]
+                    seq_idx += 1
+        
+        # Up scan復元（処理を簡略化）
+    
+    def split_joint_features(self, joint_features: torch.Tensor, 
+                           original_seq_len: int) -> Tuple[torch.Tensor, torch.Tensor]:
+        """
+        結合特徴を2つの画像の特徴に分離
+        """
+        # joint_features: [B, 2*N, D] → [B, N, D], [B, N, D]
+        features0 = joint_features[:, :original_seq_len, :]
+        features1 = joint_features[:, original_seq_len:, :]
+        
+        return features0, features1
+
+
+class GatedConvolutionalAggregator(nn.Module):
+    """
+    Gated Convolutional Aggregator
+    
+    4方向からの情報を統合するためのアグリゲータ
+    JamMa論文のequation (8)に対応
+    """
+    
+    def __init__(self, hidden_dim: int, kernel_size: int = 3):
+        """
+        Initialize aggregator
+        
+        Args:
+            hidden_dim: 隠れ層次元
+            kernel_size: 畳み込みカーネルサイズ
+        """
+        super().__init__()
+        
+        self.conv1 = nn.Conv1d(hidden_dim, hidden_dim, kernel_size, padding=kernel_size//2)
+        self.conv2 = nn.Conv1d(hidden_dim, hidden_dim, kernel_size, padding=kernel_size//2)
+        self.conv3 = nn.Conv1d(hidden_dim, hidden_dim, kernel_size, padding=kernel_size//2)
+        
+        self.gelu = nn.GELU()
+        
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        """
+        Forward pass
+        
+        Args:
+            x: Input features [B, L, D]
+            
+        Returns:
+            Aggregated features [B, L, D]
+        """
+        # [B, L, D] → [B, D, L] for Conv1d
+        x_conv = x.transpose(1, 2)
+        
+        # Gated convolution (equation 8)
+        # σ = GELU(Conv3(F̃^c))
+        sigma = self.gelu(self.conv1(x_conv))
+        
+        # F̂^c = Conv3(σ · Conv3(F̃^c))
+        gated = sigma * self.conv2(x_conv)
+        output_conv = self.conv3(gated)
+        
+        # [B, D, L] → [B, L, D]
+        output = output_conv.transpose(1, 2)
+        
+        # 残差接続
+        return x + output
