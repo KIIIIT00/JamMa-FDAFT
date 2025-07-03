@@ -1,0 +1,49 @@
+# Core dependencies
+torch>=1.12.0
+torchvision>=0.13.0
+torchaudio>=0.12.0
+
+# Computer Vision & Image Processing
+opencv-contrib-python>=4.5.0
+scikit-image>=0.18.0
+kornia>=0.6.0
+albumentations>=1.3.0
+
+# Scientific Computing
+numpy>=1.19.0
+scipy>=1.5.0
+matplotlib>=3.3.0
+seaborn>=0.11.0
+plotly>=5.9.0
+
+# Utilities
+einops>=0.6.0
+tqdm>=4.64.0
+h5py>=3.7.0
+pandas>=1.4.0
+pyyaml>=6.0.0
+
+# Logging & Monitoring
+tensorboard>=2.9.0
+wandb>=0.13.0
+
+# Training & Optimization
+pytorch-lightning>=1.7.0
+timm>=0.6.0
+
+# Configuration Management
+hydra-core>=1.2.0
+omegaconf>=2.2.0
+
+# Evaluation & Metrics
+scikit-learn>=1.1.0
+
+# Development tools (optional - install with pip install -e ".[dev]")
+# pytest>=7.0.0
+# pytest-cov>=3.0.0
+# black>=22.0.0
+# flake8>=4.0.0
+# isort>=5.10.0
+# mypy>=0.950
+# jupyter>=1.0.0
+# jupyterlab>=3.4.0
