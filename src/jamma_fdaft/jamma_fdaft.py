@@ -13,8 +13,8 @@ import torch
 from torch import nn
 import torch.nn.functional as F
 from einops.einops import rearrange
-from .mamba_module import JointMamba
-from .matching_module import CoarseMatching, FineSubMatching
+from ..jamma.jamma import JointMamba
+from .components.matching_module import FDAFTCoarseMatching, FDAFTFineMatching
 from .components.utils import KeypointEncoder_wo_score, up_conv4, MLPMixerEncoderLayer, normalize_keypoints
 from ..utils.profiler import PassThroughProfiler
 
@@ -49,7 +49,7 @@ class JamMaFDAFT(nn.Module):
         )
         
         # Coarse matching module
-        self.coarse_matching = CoarseMatching(config['match_coarse'], self.profiler)
+        self.coarse_matching = FDAFTCoarseMatching(config['match_coarse'], self.profiler)
 
         # Fine-level feature processing network
         self.act = nn.GELU()
@@ -66,7 +66,7 @@ class JamMaFDAFT(nn.Module):
         self.fine_enc = nn.ModuleList([MLPMixerEncoderLayer(2*W**2, 64) for _ in range(4)])
         
         # Fine matching and sub-pixel refinement
-        self.fine_matching = FineSubMatching(config, self.profiler)
+        self.fine_matching = FDAFTCoarseMatching(config, self.profiler)
 
     def coarse_match(self, data):
         """
