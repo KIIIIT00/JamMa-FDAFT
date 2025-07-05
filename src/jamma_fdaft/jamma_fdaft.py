@@ -13,7 +13,7 @@ import torch
 from torch import nn
 import torch.nn.functional as F
 from einops.einops import rearrange
-from ..jamma.jamma import JointMamba
+from .components.jamma import JointMamba
 from .components.matching_module import FDAFTCoarseMatching, FDAFTFineMatching
 from .components.utils import KeypointEncoder_wo_score, up_conv4, MLPMixerEncoderLayer, normalize_keypoints
 from ..utils.profiler import PassThroughProfiler
