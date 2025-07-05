@@ -21,21 +21,21 @@ import numpy as np
 import pytorch_lightning as pl
 from matplotlib import pyplot as plt
 
-from ..jamma_fdaft.jamma_fdaft import JamMaFDAFT
-from ..jamma_fdaft.backbone_fdaft import FDAFTEncoder
-from ..jamma.utils.supervision import compute_supervision_fine, compute_supervision_coarse
-from ..losses.loss import Loss
-from ..optimizers import build_optimizer, build_scheduler
-from ..utils.metrics import (
+from src.jamma_fdaft.jamma_fdaft import JamMaFDAFT
+from src.jamma_fdaft.backbone_fdaft import FDAFTEncoder
+from src.jamma.utils.supervision import compute_supervision_fine, compute_supervision_coarse
+from src.losses.loss import Loss
+from src.optimizers import build_optimizer, build_scheduler
+from src.utils.metrics import (
     compute_f1,
     compute_symmetrical_epipolar_errors,
     compute_pose_errors,
     aggregate_metrics_train_val, aggregate_metrics_test
 )
-from ..utils.comm import gather, all_gather
-from ..utils.misc import lower_config, flattenList
-from ..utils.profiler import PassThroughProfiler
-from ..utils.plotting import make_matching_figures
+from src.utils.comm import gather, all_gather
+from src.utils.misc import lower_config, flattenList
+from src.utils.profiler import PassThroughProfiler
+from src.utils.plotting import make_matching_figures
 
 
 class PL_JamMaFDAFT(pl.LightningModule):

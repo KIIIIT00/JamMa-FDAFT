@@ -13,10 +13,10 @@ import torch
 from torch import nn
 import torch.nn.functional as F
 from einops.einops import rearrange
-from .components.jamma import JointMamba
-from .components.matching_module import FDAFTCoarseMatching, FDAFTFineMatching
-from .components.utils import KeypointEncoder_wo_score, up_conv4, MLPMixerEncoderLayer, normalize_keypoints
-from ..utils.profiler import PassThroughProfiler
+from src.jamma_fdaft.components.jamma import JointMamba
+from src.jamma_fdaft.components.matching_module import FDAFTCoarseMatching, FDAFTFineMatching
+from src.jamma_fdaft.components.utils import KeypointEncoder_wo_score, up_conv4, MLPMixerEncoderLayer, normalize_keypoints
+from src.utils.profiler import PassThroughProfiler
 
 torch.backends.cudnn.deterministic = True
 INF = 1E9
