@@ -307,10 +307,10 @@ class FDAFTFineMatching(nn.Module):
         self.profiler = profiler
         
         # Configuration
-        self.temperature = config['fine']['dsmax_temperature']
-        self.W_f = config['fine_window_size']
-        self.inference = config['fine']['inference']
-        self.fine_thr = config['fine']['thr'] * 0.8  # Lower threshold for FDAFT
+        self.temperature = config.FINE.DSMAX_TEMPERATURE
+        self.W_f = config.FINE_WINDOW_SIZE
+        self.inference = config.FINE.INFERENCE
+        self.fine_thr = config.FINE.THR * 0.8
         
         dim_f = 64
         

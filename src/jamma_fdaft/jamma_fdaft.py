@@ -70,7 +70,7 @@ class JamMaFDAFT(nn.Module):
         self.fine_enc = nn.ModuleList([MLPMixerEncoderLayer(2*W**2, 64) for _ in range(4)])
         
         # Fine matching and sub-pixel refinement
-        self.fine_matching = FDAFTCoarseMatching(config, self.profiler)
+        self.fine_matching = FDAFTFineMatching(config, self.profiler)
 
     def coarse_match(self, data):
         """
@@ -243,7 +243,7 @@ class JamMaFDAFT(nn.Module):
             "parameters": {
                 "coarse_d_model": self.d_model_c,
                 "fine_d_model": self.d_model_f,
-                "fine_window_size": self.config['fine_window_size'],
-                "resolution": self.config['resolution']
+                "fine_window_size": self.config.FINE_WINDOW_SIZE, 
+                "resolution": self.config.RESOLUTION
             }
         }

@@ -9,6 +9,7 @@ import numpy as np
 import cv2
 from scipy import ndimage
 from skimage import feature, measure
+from skimage.feature import peak_local_maxima
 from sklearn.ensemble import RandomForestClassifier
 import pickle
 import os
