@@ -1,11 +1,7 @@
 """
-FDAFT Backbone Encoder for JamMa-FDAFT
+修正されたFDAFT Backbone Encoder
 
-This module replaces the ConvNext backbone in original JamMa with FDAFT-based feature extraction.
-It provides multi-scale features optimized for planetary remote sensing images.
-
-Architecture:
-Input Images → Double-Frequency Scale Space → Feature Detection → Feature Processing → Multi-scale Features
+設定に基づいて出力次元を動的に調整し、異なる解像度の画像にも対応
 """
 
 import torch
@@ -23,11 +19,10 @@ class FDAFTEncoder(nn.Module):
     """
     FDAFT-based backbone encoder for planetary image feature extraction
     
-    Replaces ConvNext backbone with FDAFT components optimized for:
-    - Weak surface textures in planetary images
-    - Gradual illumination changes
-    - Crater-like circular structures
-    - Multi-scale feature extraction
+    修正点：
+    - 設定に基づいて出力次元を動的に調整
+    - 異なる解像度の画像に対応
+    - より柔軟な特徴変換ネットワーク
     """
     
     def __init__(self, 
@@ -35,7 +30,9 @@ class FDAFTEncoder(nn.Module):
                  sigma_0: float = 1.0,
                  use_structured_forests: bool = True,
                  max_keypoints: int = 2000,
-                 nms_radius: int = 5):
+                 nms_radius: int = 5,
+                 coarse_dim: int = 256,
+                 fine_dim: int = 128):
         """
         Initialize FDAFT encoder
         
@@ -45,6 +42,8 @@ class FDAFTEncoder(nn.Module):
             use_structured_forests: Whether to use pre-trained Structured Forests
             max_keypoints: Maximum keypoints for feature detection
             nms_radius: Non-maximum suppression radius
+            coarse_dim: Output dimension for coarse features (1/8 resolution)
+            fine_dim: Output dimension for fine features (1/4 resolution)
         """
         super().__init__()
         
@@ -52,35 +51,87 @@ class FDAFTEncoder(nn.Module):
         self.sigma_0 = sigma_0
         self.use_structured_forests = use_structured_forests
         self.max_keypoints = max_keypoints
+        self.coarse_dim = coarse_dim
+        self.fine_dim = fine_dim
         
         # FDAFT components
         self.scale_space = DoubleFrequencyScaleSpace(num_layers, sigma_0)
         self.detector = FeatureDetector(nms_radius, max_keypoints, use_kaze=True)
         
-        # Feature processing networks
-        # Convert FDAFT features to JamMa-compatible feature maps
+        # Feature processing networks - 動的に次元を調整
+        # Coarse features (1/8 resolution)
         self.feature_conv_8 = nn.Sequential(
-            nn.Conv2d(2, 128, kernel_size=3, padding=1),  # 2 channels from FDAFT
-            nn.BatchNorm2d(128),
-            nn.GELU(),
-            nn.Conv2d(128, 256, kernel_size=3, padding=1),  # Match JamMa dimensions
-            nn.BatchNorm2d(256),
-            nn.GELU()
-        )
-        
-        self.feature_conv_4 = nn.Sequential(
-            nn.Conv2d(2, 64, kernel_size=3, padding=1),
+            nn.Conv2d(2, 64, kernel_size=3, padding=1),  # 2 channels from FDAFT
             nn.BatchNorm2d(64),
             nn.GELU(),
-            nn.Conv2d(64, 128, kernel_size=3, padding=1),  # Match JamMa dimensions
+            nn.Conv2d(64, 128, kernel_size=3, padding=1),
             nn.BatchNorm2d(128),
+            nn.GELU(),
+            nn.Conv2d(128, coarse_dim, kernel_size=3, padding=1),  # 設定に基づく出力次元
+            nn.BatchNorm2d(coarse_dim),
             nn.GELU()
         )
         
-        # Adaptive pooling for consistent feature map sizes
-        self.adaptive_pool_8 = nn.AdaptiveAvgPool2d((None, None))  # Will be set dynamically
-        self.adaptive_pool_4 = nn.AdaptiveAvgPool2d((None, None))  # Will be set dynamically
+        # Fine features (1/4 resolution)
+        self.feature_conv_4 = nn.Sequential(
+            nn.Conv2d(2, 32, kernel_size=3, padding=1),
+            nn.BatchNorm2d(32),
+            nn.GELU(),
+            nn.Conv2d(32, 64, kernel_size=3, padding=1),
+            nn.BatchNorm2d(64),
+            nn.GELU(),
+            nn.Conv2d(64, fine_dim, kernel_size=3, padding=1),  # 設定に基づく出力次元
+            nn.BatchNorm2d(fine_dim),
+            nn.GELU()
+        )
         
+        # 解像度適応のためのアダプティブプーリング
+        self.adaptive_pool_8 = nn.AdaptiveAvgPool2d((None, None))
+        self.adaptive_pool_4 = nn.AdaptiveAvgPool2d((None, None))
+        
+    @classmethod
+    def from_config(cls, config):
+        """設定から FDAFTEncoder を作成"""
+        fdaft_config = getattr(config, 'FDAFT', None)
+        jamma_config = getattr(config, 'JAMMA', None)
+        
+        # デフォルト値
+        num_layers = 3
+        sigma_0 = 1.0
+        use_structured_forests = True
+        max_keypoints = 2000
+        nms_radius = 5
+        coarse_dim = 256
+        fine_dim = 128
+        
+        # FDAFT設定から読み込み
+        if fdaft_config:
+            num_layers = getattr(fdaft_config, 'NUM_LAYERS', num_layers)
+            sigma_0 = getattr(fdaft_config, 'SIGMA_0', sigma_0)
+            use_structured_forests = getattr(fdaft_config, 'USE_STRUCTURED_FORESTS', use_structured_forests)
+            max_keypoints = getattr(fdaft_config, 'MAX_KEYPOINTS', max_keypoints)
+            nms_radius = getattr(fdaft_config, 'NMS_RADIUS', nms_radius)
+        
+        # JamMa設定から次元を読み込み
+        if jamma_config:
+            coarse_config = getattr(jamma_config, 'COARSE', None)
+            fine_config = getattr(jamma_config, 'FINE', None)
+            
+            if coarse_config:
+                coarse_dim = getattr(coarse_config, 'D_MODEL', coarse_dim)
+            if fine_config:
+                fine_dim = getattr(fine_config, 'D_MODEL', fine_dim)
+        
+        return cls(
+            num_layers=num_layers,
+            sigma_0=sigma_0,
+            use_structured_forests=use_structured_forests,
+            max_keypoints=max_keypoints,
+            nms_radius=nms_radius,
+            coarse_dim=coarse_dim,
+            fine_dim=fine_dim
+        )
+    
     def preprocess_images(self, image_batch):
         """
         Preprocess batch of images for FDAFT processing
@@ -252,12 +303,12 @@ class FDAFTEncoder(nn.Module):
         features_4_batch = torch.stack(all_features_4, dim=0)  # [2B, 2, H/4, W/4]
         
         # Process through feature convolution networks
-        feat_8_processed = self.feature_conv_8(features_8_batch)  # [2B, 256, H/8, W/8]
-        feat_4_processed = self.feature_conv_4(features_4_batch)  # [2B, 128, H/4, W/4]
+        feat_8_processed = self.feature_conv_8(features_8_batch)  # [2B, coarse_dim, H/8, W/8]
+        feat_4_processed = self.feature_conv_4(features_4_batch)  # [2B, fine_dim, H/4, W/4]
         
         # Split back into two images
-        feat_8_0, feat_8_1 = torch.chunk(feat_8_processed, 2, dim=0)  # [B, 256, H/8, W/8]
-        feat_4_0, feat_4_1 = torch.chunk(feat_4_processed, 2, dim=0)  # [B, 128, H/4, W/4]
+        feat_8_0, feat_8_1 = torch.chunk(feat_8_processed, 2, dim=0)  # [B, coarse_dim, H/8, W/8]
+        feat_4_0, feat_4_1 = torch.chunk(feat_4_processed, 2, dim=0)  # [B, fine_dim, H/4, W/4]
         
         # Create coordinate grids for position encoding
         scale = 8
@@ -272,7 +323,7 @@ class FDAFTEncoder(nn.Module):
         # Update data with FDAFT features
         data.update({
             'bs': B,
-            'c': feat_8_0.shape[1],  # Feature dimension
+            'c': feat_8_0.shape[1],  # Feature dimension (動的に設定される)
             'h_8': h_8,
             'w_8': w_8,
             'hw_8': h_8 * w_8,
@@ -296,15 +347,20 @@ class FDAFTEncoder(nn.Module):
             "initial_scale": self.sigma_0,
             "structured_forests": self.use_structured_forests,
             "max_keypoints": self.max_keypoints,
+            "output_dimensions": {
+                "coarse_dim": self.coarse_dim,
+                "fine_dim": self.fine_dim
+            },
             "optimizations": {
                 "edge_confidence_map": "Machine learning-based structured edge detection",
                 "phase_congruency": "Weighted phase congruency for texture analysis",
                 "double_frequency": "Separate low/high frequency processing",
-                "planetary_specific": "Optimized for weak textures and gradual transitions"
+                "planetary_specific": "Optimized for weak textures and gradual transitions",
+                "resolution_adaptive": "Dynamic dimension adjustment for different resolutions"
             },
             "output_features": {
-                "feat_8": "256-dim features at 1/8 resolution (coarse)",
-                "feat_4": "128-dim features at 1/4 resolution (fine)",
+                "feat_8": f"{self.coarse_dim}-dim features at 1/8 resolution (coarse)",
+                "feat_4": f"{self.fine_dim}-dim features at 1/4 resolution (fine)",
                 "scale_spaces": "Low/high frequency scale space representations"
             }
         }

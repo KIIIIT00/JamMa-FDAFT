@@ -9,10 +9,39 @@ import numpy as np
 import cv2
 from scipy import ndimage
 from skimage import feature, measure
-from skimage.feature import peak_local_maxima
 from sklearn.ensemble import RandomForestClassifier
+from scipy.ndimage import maximum_filter
 import pickle
 import os
+
+
+def find_local_maxima(image, min_distance=5, threshold_abs=0.01):
+    """
+    Find local maxima in an image - scikit-image independent implementation
+    
+    Args:
+        image: Input image
+        min_distance: Minimum distance between peaks
+        threshold_abs: Minimum threshold for peak detection
+        
+    Returns:
+        List of (row, col) coordinates of local maxima
+    """
+    # Apply threshold
+    mask = image > threshold_abs
+    
+    # Find local maxima using maximum filter
+    local_maxima = maximum_filter(image, size=min_distance) == image
+    
+    # Combine threshold and local maxima
+    peaks = mask & local_maxima
+    
+    # Get coordinates
+    coords = np.where(peaks)
+    if len(coords[0]) > 0:
+        return list(zip(coords[0], coords[1]))
+    else:
+        return []
 
 
 class FeatureDetector:
@@ -139,14 +168,14 @@ class FeatureDetector:
             
             # Harris corners (local maxima)
             if len(corners) < self.max_keypoints // len(scale_space):
-                harris_corners = feature.corner_peaks(
+                # Use our custom local maxima finder
+                harris_corners = find_local_maxima(
                     harris_response, 
                     min_distance=self.nms_radius,
                     threshold_abs=0.01 * harris_response.max()
                 )
                 
-                for corner in harris_corners:
-                    y, x = corner
+                for y, x in harris_corners:
                     if self._is_valid_point(x, y, layer.shape):
                         corners.append([x, y, i])
                         scores.append(harris_response[y, x])
@@ -210,8 +239,8 @@ class FeatureDetector:
             sigma = 1.0 * (2 ** i)  # Scale-dependent sigma
             log_response = -sigma**2 * ndimage.gaussian_laplace(layer_norm, sigma)
             
-            # Find local maxima
-            blob_candidates = feature.peak_local_maxima(
+            # Find local maxima using our custom implementation
+            blob_candidates = find_local_maxima(
                 log_response,
                 min_distance=self.nms_radius,
                 threshold_abs=0.01
@@ -231,8 +260,7 @@ class FeatureDetector:
                         
             except:
                 # Fallback to LoG blobs
-                for idx in blob_candidates[0]:
-                    y, x = np.unravel_index(idx, log_response.shape)
+                for y, x in blob_candidates:
                     if self._is_valid_point(x, y, layer.shape):
                         all_blobs.append([x, y, i, sigma])
                         all_scores.append(log_response[y, x])
