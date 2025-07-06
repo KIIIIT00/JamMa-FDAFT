@@ -77,7 +77,7 @@ class FDAFTCoarseMatching(nn.Module):
         
         # Configuration
         d_model = 256  # Match FDAFT output dimension
-        self.thr = config['thr']
+        self.thr = config.THR
         self.use_sm = config['use_sm']
         self.inference = config['inference']
         self.border_rm = config['border_rm']

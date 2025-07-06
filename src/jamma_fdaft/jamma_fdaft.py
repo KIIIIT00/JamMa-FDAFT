@@ -33,8 +33,10 @@ class JamMaFDAFT(nn.Module):
         super().__init__()
         self.config = config
         self.profiler = profiler or PassThroughProfiler()
-        self.d_model_c = self.config['coarse']['d_model']
-        self.d_model_f = self.config['fine']['d_model']
+        # self.d_model_c = self.config['coarse']['d_model']
+        # self.d_model_f = self.config['fine']['d_model']
+        self.d_model_c = self.config.COARSE.D_MODEL
+        self.d_model_f = self.config.FINE.D_MODEL
 
         # Keypoint encoder for position embedding
         self.kenc = KeypointEncoder_wo_score(self.d_model_c, [32, 64, 128, self.d_model_c])
@@ -49,7 +51,8 @@ class JamMaFDAFT(nn.Module):
         )
         
         # Coarse matching module
-        self.coarse_matching = FDAFTCoarseMatching(config['match_coarse'], self.profiler)
+        # self.coarse_matching = FDAFTCoarseMatching(config['match_coarse'], self.profiler)
+        coarse_match_cfg = self.config.COARSE
 
         # Fine-level feature processing network
         self.act = nn.GELU()
@@ -62,7 +65,8 @@ class JamMaFDAFT(nn.Module):
         self.conv8b = nn.Conv2d(dim[2], dim[2], kernel_size=3, stride=1, padding=1)
 
         # Fine-level encoder
-        W = self.config['fine_window_size']
+        # W = self.config['fine_window_size']
+        W = self.config.FINE_WINDOW_SIZE
         self.fine_enc = nn.ModuleList([MLPMixerEncoderLayer(2*W**2, 64) for _ in range(4)])
         
         # Fine matching and sub-pixel refinement
