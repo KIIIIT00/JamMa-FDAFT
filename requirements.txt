@@ -85,7 +85,7 @@ torchmetrics==0.6.0
 torchvision==0.15.2
 tqdm==4.67.1
 transformers==4.46.3
-# triton==2.0.0
+triton==2.0.0
 typing_extensions==4.12.2
 urllib3==2.2.3
 Werkzeug==3.0.6
