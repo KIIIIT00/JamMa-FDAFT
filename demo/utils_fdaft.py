@@ -1,5 +1,5 @@
 """
-JamMa-FDAFT Demo Utilities
+JamMa-FDAFT Demo Utilities (修正版)
 
 JamMaの学習済みモデルを使用するFDAFT統合版のユーティリティ
 demo/utils.pyのFDAFT対応版（完全互換性確保）
@@ -31,14 +31,90 @@ class JamMaFDAFTDemo(nn.Module):
     def __init__(self, config, pretrained='official') -> None:
         super().__init__()
         
-        # FDAFTバックボーン（FDAFT設定を辞書から作成）
-        self.backbone = self._create_fdaft_backbone(config)
+        print("🔧 JamMa-FDAFTデモモデルを初期化中...")
         
+        # 設定を辞書形式に変換（config が既に辞書の場合はそのまま使用）
+        if hasattr(config, 'keys'):  # 辞書の場合
+            self.jamma_config = config
+        else:  # YACS設定の場合
+            self.jamma_config = self._convert_config_to_dict(config)
+        
+        # FDAFTバックボーン（FDAFT設定を辞書から作成）
+        try:
+            self.backbone = self._create_fdaft_backbone(self.jamma_config)
+            print("✅ FDAFTバックボーン初期化完了")
+        except Exception as e:
+            print(f"❌ FDAFTバックボーン初期化失敗: {e}")
+            # フォールバック: ConvNextV2を使用
+            print("🔄 ConvNextV2バックボーンにフォールバック")
+            self.backbone = CovNextV2_nano()
+
         # JamMaマッチャー（オリジナルのJamMaクラスを使用）
-        self.matcher = JamMa_(config)
+        try:
+            self.matcher = JamMa_(self.jamma_config)
+            print("✅ JamMaマッチャー初期化完了")
+        except Exception as e:
+            print(f"❌ JamMaマッチャー初期化失敗: {e}")
+            raise
         
         # JamMaの学習済みモデルをロード
         self._load_pretrained_weights(pretrained)
+
+    def _convert_config_to_dict(self, yacs_config):
+        """YACS設定を辞書形式に変換"""
+        try:
+            jamma_cfg = yacs_config.JAMMA
+            
+            config_dict = {
+                'coarse': {
+                    'd_model': jamma_cfg.COARSE.D_MODEL,
+                },
+                'fine': {
+                    'd_model': jamma_cfg.FINE.D_MODEL,
+                    'dsmax_temperature': getattr(jamma_cfg.FINE, 'DSMAX_TEMPERATURE', 0.1),
+                    'thr': jamma_cfg.FINE.THR,
+                    'inference': jamma_cfg.FINE.INFERENCE
+                },
+                'match_coarse': {
+                    'thr': jamma_cfg.MATCH_COARSE.THR,
+                    'use_sm': jamma_cfg.MATCH_COARSE.USE_SM,
+                    'border_rm': jamma_cfg.MATCH_COARSE.BORDER_RM,
+                    'dsmax_temperature': getattr(jamma_cfg.MATCH_COARSE, 'DSMAX_TEMPERATURE', 0.1),
+                    'inference': jamma_cfg.MATCH_COARSE.INFERENCE,
+                    'train_coarse_percent': getattr(jamma_cfg.MATCH_COARSE, 'TRAIN_COARSE_PERCENT', 0.3),
+                    'train_pad_num_gt_min': getattr(jamma_cfg.MATCH_COARSE, 'TRAIN_PAD_NUM_GT_MIN', 20)
+                },
+                'fine_window_size': jamma_cfg.FINE_WINDOW_SIZE,
+                'resolution': list(jamma_cfg.RESOLUTION)  # tupleをlistに変換
+            }
+            
+            return config_dict
+            
+        except Exception as e:
+            print(f"設定変換エラー: {e}")
+            # フォールバック設定
+            return {
+                'coarse': {
+                    'd_model': 256,
+                },
+                'fine': {
+                    'd_model': 64,
+                    'dsmax_temperature': 0.1,
+                    'thr': 0.1,
+                    'inference': True
+                },
+                'match_coarse': {
+                    'thr': 0.2,
+                    'use_sm': True,
+                    'border_rm': 2,
+                    'dsmax_temperature': 0.1,
+                    'inference': True,
+                    'train_coarse_percent': 0.3,
+                    'train_pad_num_gt_min': 20
+                },
+                'fine_window_size': 5,
+                'resolution': [8, 2]
+            }
 
     def _create_fdaft_backbone(self, config):
         """JamMa設定からFDAFT設定を作成してFDAFTバックボーンを初期化"""
@@ -68,6 +144,7 @@ class JamMaFDAFTDemo(nn.Module):
         """JamMaの学習済みモデルをロード"""
         if pretrained == 'official':
             try:
+                print("📥 JamMa公式学習済みモデルをロード中...")
                 # JamMaの公式学習済みモデルをロード
                 state_dict = torch.hub.load_state_dict_from_url(
                     'https://github.com/leoluxxx/JamMa/releases/download/v0.1/jamma.ckpt',
@@ -90,10 +167,13 @@ class JamMaFDAFTDemo(nn.Module):
                 logger.info(f"✓ JamMa official weights loaded successfully")
                 logger.info(f"  Missing keys (expected for FDAFT): {len(missing_keys)}")
                 logger.info(f"  Unexpected keys: {len(unexpected_keys)}")
+                print("✅ JamMa学習済みモデルを読み込み完了")
                 
             except Exception as e:
                 logger.warning(f"Failed to load official JamMa weights: {e}")
                 logger.info("Using random initialization")
+                print(f"⚠️ JamMa学習済みモデルの読み込みに失敗: {e}")
+                print("🔄 スクラッチから初期化します")
                 
         elif pretrained:
             try:
@@ -114,10 +194,12 @@ class JamMaFDAFTDemo(nn.Module):
                 logger.info(f"✓ JamMa weights loaded from: {pretrained}")
                 logger.info(f"  Missing keys (expected for FDAFT): {len(missing_keys)}")
                 logger.info(f"  Unexpected keys: {len(unexpected_keys)}")
+                print(f"✅ JamMa重みを読み込み完了: {pretrained}")
                 
             except Exception as e:
                 logger.warning(f"Failed to load JamMa weights from {pretrained}: {e}")
                 logger.info("Using random initialization")
+                print(f"⚠️ JamMa重みの読み込みに失敗: {e}")
 
     def forward(self, data):
         """Forward pass - demo/utils.pyのJamMaクラスと同じインターフェース"""

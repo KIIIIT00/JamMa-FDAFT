@@ -2,8 +2,8 @@
 修正されたJamMa-FDAFT Complete Demonstration Script
 
 主な修正点：
-- パスの問題を解決
-- インポートパスを修正
+- 設定の形式変換を修正
+- JamMaクラスとの互換性を確保
 - エラーハンドリングを改善
 """
 
@@ -29,7 +29,6 @@ if src_path not in sys.path:
 
 print(f"Project root: {project_root}")
 print(f"Src path: {src_path}")
-print(f"Python path: {sys.path[:3]}...")  # 最初の3つだけ表示
 
 try:
     # JamMa-FDAFT関連のインポート
@@ -44,55 +43,6 @@ try:
     print("✅ すべてのモジュールが正常にインポートされました")
 except ImportError as e:
     print(f"❌ インポートエラー: {e}")
-    print("\n利用可能なパスを確認中...")
-    
-    # デバッグ情報
-    print(f"Current directory: {current_dir}")
-    print(f"Project root exists: {os.path.exists(project_root)}")
-    print(f"Src directory exists: {os.path.exists(src_path)}")
-    
-    # src/jamma_fdaft の存在確認
-    jamma_fdaft_path = os.path.join(src_path, 'jamma_fdaft')
-    print(f"jamma_fdaft directory exists: {os.path.exists(jamma_fdaft_path)}")
-    
-    if os.path.exists(jamma_fdaft_path):
-        print("jamma_fdaft directory contents:")
-        for item in os.listdir(jamma_fdaft_path):
-            print(f"  - {item}")
-    
-    # 利用可能なモジュールの確認
-    print("\nsrcディレクトリの内容:")
-    if os.path.exists(src_path):
-        for item in os.listdir(src_path):
-            print(f"  - {item}")
-    
-    print("\n基本的なインポートテスト:")
-    try:
-        import src
-        print("✅ src モジュールは利用可能")
-    except ImportError:
-        print("❌ src モジュールが利用不可")
-    
-    try:
-        from src import jamma
-        print("✅ src.jamma モジュールは利用可能")
-    except ImportError as e2:
-        print(f"❌ src.jamma モジュールが利用不可: {e2}")
-    
-    try:
-        from src import jamma_fdaft
-        print("✅ src.jamma_fdaft モジュールは利用可能")
-    except ImportError as e3:
-        print(f"❌ src.jamma_fdaft モジュールが利用不可: {e3}")
-    
-    print("\n解決策:")
-    print("1. プロジェクトルートから実行してください:")
-    print(f"   cd {project_root}")
-    print("   python demo/demo_jamma_fdaft.py")
-    print("\n2. または、以下のコマンドでモジュールとして実行:")
-    print("   python -m demo.demo_jamma_fdaft")
-    print("\n3. src/__init__.py ファイルが存在することを確認してください")
-    
     sys.exit(1)
 
 
@@ -108,6 +58,9 @@ class JamMaFDAFTDemo(nn.Module):
         
         print("🔧 JamMa-FDAFTデモモデルを初期化中...")
         
+        # 設定を辞書形式に変換（JamMa互換）
+        self.jamma_config = self._convert_config_to_dict(config)
+        
         # FDAFTエンコーダーを初期化（JamMaの次元に合わせる）
         try:
             self.fdaft_backbone = FDAFTEncoder.from_config(config)
@@ -121,7 +74,8 @@ class JamMaFDAFTDemo(nn.Module):
         # JamMaの学習済みモデルを読み込み
         try:
             self.jamma_backbone = CovNextV2_nano()
-            self.jamma_matcher = JamMa(config=config.JAMMA, profiler=None)
+            # 辞書形式の設定をJamMaに渡す
+            self.jamma_matcher = JamMa(config=self.jamma_config, profiler=None)
             print("✅ JamMaマッチャー初期化完了")
         except Exception as e:
             print(f"❌ JamMaマッチャー初期化失敗: {e}")
@@ -165,6 +119,63 @@ class JamMaFDAFTDemo(nn.Module):
             nn.BatchNorm2d(128),
             nn.ReLU(inplace=True)
         )
+    
+    def _convert_config_to_dict(self, yacs_config):
+        """YACS設定を辞書形式に変換してJamMa互換にする"""
+        try:
+            # YACSオブジェクトから必要な設定を取得
+            jamma_cfg = yacs_config.JAMMA
+            
+            config_dict = {
+                'coarse': {
+                    'd_model': jamma_cfg.COARSE.D_MODEL,
+                },
+                'fine': {
+                    'd_model': jamma_cfg.FINE.D_MODEL,
+                    'dsmax_temperature': getattr(jamma_cfg.FINE, 'DSMAX_TEMPERATURE', 0.1),
+                    'thr': jamma_cfg.FINE.THR,
+                    'inference': jamma_cfg.FINE.INFERENCE
+                },
+                'match_coarse': {
+                    'thr': jamma_cfg.MATCH_COARSE.THR,
+                    'use_sm': jamma_cfg.MATCH_COARSE.USE_SM,
+                    'border_rm': jamma_cfg.MATCH_COARSE.BORDER_RM,
+                    'dsmax_temperature': getattr(jamma_cfg.MATCH_COARSE, 'DSMAX_TEMPERATURE', 0.1),
+                    'inference': jamma_cfg.MATCH_COARSE.INFERENCE,
+                    'train_coarse_percent': getattr(jamma_cfg.MATCH_COARSE, 'TRAIN_COARSE_PERCENT', 0.3),
+                    'train_pad_num_gt_min': getattr(jamma_cfg.MATCH_COARSE, 'TRAIN_PAD_NUM_GT_MIN', 20)
+                },
+                'fine_window_size': jamma_cfg.FINE_WINDOW_SIZE,
+                'resolution': list(jamma_cfg.RESOLUTION)  # tupleをlistに変換
+            }
+            
+            return config_dict
+            
+        except Exception as e:
+            print(f"設定変換エラー: {e}")
+            # フォールバック設定
+            return {
+                'coarse': {
+                    'd_model': 256,
+                },
+                'fine': {
+                    'd_model': 128,
+                    'dsmax_temperature': 0.1,
+                    'thr': 0.1,
+                    'inference': True
+                },
+                'match_coarse': {
+                    'thr': 0.2,
+                    'use_sm': True,
+                    'border_rm': 2,
+                    'dsmax_temperature': 0.1,
+                    'inference': True,
+                    'train_coarse_percent': 0.3,
+                    'train_pad_num_gt_min': 20
+                },
+                'fine_window_size': 5,
+                'resolution': [8, 2]
+            }
     
     def forward(self, data):
         """統合フォワードパス"""
@@ -392,7 +403,6 @@ def demonstrate_jamma_fdaft():
     try:
         # 一貫した設定作成
         config = create_demo_config()
-        _config = lower_config(config)
         
         print("  🔧 JamMa-FDAFT統合モデル初期化中...")
         device = 'cuda' if torch.cuda.is_available() else 'cpu'
