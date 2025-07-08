@@ -1,11 +1,13 @@
 """
 JamMa-FDAFT: Integrated model combining FDAFT feature extraction with JamMa's Joint Mamba and C2F matching
 
+修正版: JamMaの学習済みモデルとの完全互換性を確保
+
 Architecture: Input Images → FDAFT Encoder → Joint Mamba (JEGO) → C2F Matching
 
 This implementation integrates:
 - FDAFT: Fast Double-Channel Aggregated Feature Transform for robust planetary image feature extraction
-- JamMa: Joint Mamba for efficient long-range feature interaction
+- JamMa: Joint Mamba for efficient long-range feature interaction (学習済みモデル使用)
 - C2F Matching: Coarse-to-Fine hierarchical matching with sub-pixel refinement
 """
 
@@ -26,14 +28,16 @@ class JamMaFDAFT(nn.Module):
     """
     JamMa-FDAFT: Integrated model for planetary remote sensing image matching
     
-    Combines FDAFT's robust feature extraction with JamMa's efficient matching pipeline
-    Compatible with original JamMa pretrained weights for the matching components
+    修正版: JamMaの学習済みモデルとの完全互換性を確保
+    - 元のJamMaアーキテクチャを完全に保持
+    - FDAFTはfeature extractionのみを担当
+    - JamMaのmatching componentはそのまま使用
     """
     
     def __init__(self, config, profiler=None):
         super().__init__()
         
-        # Convert config to dictionary format if needed (for compatibility)
+        # Convert config to dictionary format if needed (JamMa互換)
         if hasattr(config, 'COARSE'):
             # Convert from YACS format to dict format for JamMa components
             self.config = self._convert_config_to_dict(config)
@@ -44,6 +48,7 @@ class JamMaFDAFT(nn.Module):
         self.d_model_c = self.config['coarse']['d_model']
         self.d_model_f = self.config['fine']['d_model']
 
+        # JamMaと完全に同じコンポーネント構成
         # Keypoint encoder for position embedding (same as JamMa)
         self.kenc = KeypointEncoder_wo_score(self.d_model_c, [32, 64, 128, self.d_model_c])
         
@@ -105,7 +110,7 @@ class JamMaFDAFT(nn.Module):
     def load_jamma_pretrained_weights(self, pretrained_path):
         """
         Load JamMa pretrained weights, excluding the backbone
-        This allows using FDAFT encoder while keeping JamMa matching components
+        FDAFTエンコーダーを使用しながらJamMaマッチングコンポーネントを維持
         """
         if pretrained_path == 'official':
             # Load official JamMa weights
@@ -120,7 +125,7 @@ class JamMaFDAFT(nn.Module):
         # Filter out backbone weights and only keep matcher components
         jamma_state_dict = {}
         for key, value in state_dict.items():
-            # Skip backbone weights (we use FDAFT instead)
+            # Skip backbone weights (FDAFTを使用するため)
             if key.startswith('backbone.'):
                 continue
             # Keep matcher weights with proper naming
@@ -141,7 +146,7 @@ class JamMaFDAFT(nn.Module):
     def coarse_match(self, data):
         """
         Perform coarse-level matching using FDAFT features and Joint Mamba
-        Same as original JamMa but with FDAFT features
+        JamMaと完全に同じ処理（FDAFTの特徴を使用）
         """
         # Get FDAFT features (already processed by FDAFT backbone)
         desc0, desc1 = data['feat_8_0'].flatten(2, 3), data['feat_8_1'].flatten(2, 3)

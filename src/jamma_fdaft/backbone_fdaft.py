@@ -2,6 +2,7 @@
 修正されたFDAFT Backbone Encoder
 
 設定に基づいて出力次元を動的に調整し、異なる解像度の画像にも対応
+JamMaの学習済みモデルとの互換性を確保
 """
 
 import torch
@@ -20,6 +21,7 @@ class FDAFTEncoder(nn.Module):
     FDAFT-based backbone encoder for planetary image feature extraction
     
     修正点：
+    - JamMaの学習済みモデルとの互換性を確保
     - 設定に基づいて出力次元を動的に調整
     - 異なる解像度の画像に対応
     - より柔軟な特徴変換ネットワーク
@@ -59,7 +61,7 @@ class FDAFTEncoder(nn.Module):
         self.detector = FeatureDetector(nms_radius, max_keypoints, use_kaze=True)
         
         # Feature processing networks - 動的に次元を調整
-        # Coarse features (1/8 resolution)
+        # Coarse features (1/8 resolution) - JamMa互換
         self.feature_conv_8 = nn.Sequential(
             nn.Conv2d(2, 64, kernel_size=3, padding=1),  # 2 channels from FDAFT
             nn.BatchNorm2d(64),
@@ -67,12 +69,12 @@ class FDAFTEncoder(nn.Module):
             nn.Conv2d(64, 128, kernel_size=3, padding=1),
             nn.BatchNorm2d(128),
             nn.GELU(),
-            nn.Conv2d(128, coarse_dim, kernel_size=3, padding=1),  # 設定に基づく出力次元
+            nn.Conv2d(128, coarse_dim, kernel_size=3, padding=1),  # JamMa互換次元
             nn.BatchNorm2d(coarse_dim),
             nn.GELU()
         )
         
-        # Fine features (1/4 resolution)
+        # Fine features (1/4 resolution) - JamMa互換
         self.feature_conv_4 = nn.Sequential(
             nn.Conv2d(2, 32, kernel_size=3, padding=1),
             nn.BatchNorm2d(32),
@@ -80,18 +82,14 @@ class FDAFTEncoder(nn.Module):
             nn.Conv2d(32, 64, kernel_size=3, padding=1),
             nn.BatchNorm2d(64),
             nn.GELU(),
-            nn.Conv2d(64, fine_dim, kernel_size=3, padding=1),  # 設定に基づく出力次元
+            nn.Conv2d(64, fine_dim, kernel_size=3, padding=1),  # JamMa互換次元
             nn.BatchNorm2d(fine_dim),
             nn.GELU()
         )
         
-        # 解像度適応のためのアダプティブプーリング
-        self.adaptive_pool_8 = nn.AdaptiveAvgPool2d((None, None))
-        self.adaptive_pool_4 = nn.AdaptiveAvgPool2d((None, None))
-        
     @classmethod
     def from_config(cls, config):
-        """設定から FDAFTEncoder を作成"""
+        """設定から FDAFTEncoder を作成（JamMa互換）"""
         fdaft_config = getattr(config, 'FDAFT', None)
         jamma_config = getattr(config, 'JAMMA', None)
         
@@ -101,8 +99,8 @@ class FDAFTEncoder(nn.Module):
         use_structured_forests = True
         max_keypoints = 2000
         nms_radius = 5
-        coarse_dim = 256
-        fine_dim = 128
+        coarse_dim = 256  # JamMaデフォルト
+        fine_dim = 128    # JamMaデフォルト
         
         # FDAFT設定から読み込み
         if fdaft_config:
@@ -112,7 +110,7 @@ class FDAFTEncoder(nn.Module):
             max_keypoints = getattr(fdaft_config, 'MAX_KEYPOINTS', max_keypoints)
             nms_radius = getattr(fdaft_config, 'NMS_RADIUS', nms_radius)
         
-        # JamMa設定から次元を読み込み
+        # JamMa設定から次元を読み込み（JamMa互換性のため）
         if jamma_config:
             coarse_config = getattr(jamma_config, 'COARSE', None)
             fine_config = getattr(jamma_config, 'FINE', None)
@@ -251,7 +249,7 @@ class FDAFTEncoder(nn.Module):
     
     def forward(self, data):
         """
-        Forward pass of FDAFT encoder
+        Forward pass of FDAFT encoder (JamMa互換)
         
         Args:
             data: Dictionary containing image batch and metadata
@@ -260,7 +258,7 @@ class FDAFTEncoder(nn.Module):
             - feat_8_0, feat_8_1: Features at 1/8 resolution
             - feat_4_0, feat_4_1: Features at 1/4 resolution  
             - grid_8: Coordinate grids for position encoding
-            - Feature dimensions and metadata
+            - Feature dimensions and metadata (JamMa互換)
         """
         B, _, H, W = data['imagec_0'].shape
         
@@ -310,7 +308,7 @@ class FDAFTEncoder(nn.Module):
         feat_8_0, feat_8_1 = torch.chunk(feat_8_processed, 2, dim=0)  # [B, coarse_dim, H/8, W/8]
         feat_4_0, feat_4_1 = torch.chunk(feat_4_processed, 2, dim=0)  # [B, fine_dim, H/4, W/4]
         
-        # Create coordinate grids for position encoding
+        # Create coordinate grids for position encoding (JamMa互換)
         scale = 8
         h_8, w_8 = H // scale, W // scale
         device = data['imagec_0'].device
@@ -320,7 +318,7 @@ class FDAFTEncoder(nn.Module):
         )] * B
         grid_8 = torch.stack(grid, 0)
         
-        # Update data with FDAFT features
+        # Update data with FDAFT features (JamMa互換フォーマット)
         data.update({
             'bs': B,
             'c': feat_8_0.shape[1],  # Feature dimension (動的に設定される)
@@ -356,7 +354,7 @@ class FDAFTEncoder(nn.Module):
                 "phase_congruency": "Weighted phase congruency for texture analysis",
                 "double_frequency": "Separate low/high frequency processing",
                 "planetary_specific": "Optimized for weak textures and gradual transitions",
-                "resolution_adaptive": "Dynamic dimension adjustment for different resolutions"
+                "jamma_compatible": "Dimension-compatible with JamMa pretrained models"
             },
             "output_features": {
                 "feat_8": f"{self.coarse_dim}-dim features at 1/8 resolution (coarse)",

@@ -1,10 +1,11 @@
 """
 修正されたJamMa-FDAFT Complete Demonstration Script
 
-修正点：
-- JamMaの学習済みモデルを使用できるように修正
+主な修正点：
+- JamMaの学習済みモデルを正しく使用できるように修正
 - 設定の整合性を確保
-- FDAFTエンコーダーとJamMaマッチングの適切な統合
+- FDAFTエンコーダーとJamMa次元の適合性向上
+- 統合パイプラインの安定化
 """
 
 import sys
@@ -14,78 +15,162 @@ import cv2
 import matplotlib.pyplot as plt
 import time
 import torch
+import torch.nn as nn
 
-# Add src to path properly
-current_dir = os.path.dirname(os.path.abspath(__file__))
-project_root = os.path.dirname(current_dir)  # Go up one level from demo/ to project root
-src_path = os.path.join(project_root, 'src')
-sys.path.insert(0, project_root)
-sys.path.insert(0, src_path)
-
-print(f"Current directory: {current_dir}")
-print(f"Project root: {project_root}")
-print(f"Src path: {src_path}")
+# Add src to path
+sys.path.insert(0, os.path.join(os.path.dirname(__file__), 'src'))
 
 try:
-    from src.jamma_fdaft.backbone_fdaft import FDAFTEncoder
-    from src.jamma_fdaft.jamma_fdaft import JamMaFDAFT
-    from src.lightning.lightning_jamma_fdaft import PL_JamMaFDAFT
-    from src.config.default import get_cfg_defaults
-    from src.utils.plotting import make_matching_figures
-    print("✓ All modules imported successfully")
+    from jamma_fdaft.backbone_fdaft import FDAFTEncoder
+    from jamma.jamma import JamMa
+    from jamma.backbone import CovNextV2_nano
+    from config.default import get_cfg_defaults
+    from utils.plotting import make_matching_figures
+    from utils.dataset import read_megadepth_color
+    import torch.nn.functional as F
+    from utils.misc import lower_config
 except ImportError as e:
-    print(f"Error importing JamMa-FDAFT modules: {e}")
-    print("Available paths:")
-    for path in sys.path[:5]:  # Show first 5 paths
-        print(f"  {path}")
+    print(f"Error importing modules: {e}")
     print("Please ensure the project is properly set up.")
+    sys.exit(1)
+
+
+class JamMaFDAFTDemo(nn.Module):
+    """
+    JamMa-FDAFT統合モデル（デモ用）
+    FDAFTエンコーダー + JamMaの学習済みモデルを組み合わせ
+    """
     
-    # Try alternative import method
-    try:
-        print("Trying alternative import...")
-        sys.path.insert(0, os.path.join(project_root))
-        import src.jamma_fdaft.backbone_fdaft as backbone_fdaft
-        import src.jamma_fdaft.jamma_fdaft as jamma_fdaft
-        import src.config.default as config_default
-        import src.utils.plotting as plotting
+    def __init__(self, config, pretrained_jamma='official'):
+        super().__init__()
+        self.config = config
         
-        FDAFTEncoder = backbone_fdaft.FDAFTEncoder
-        JamMaFDAFT = jamma_fdaft.JamMaFDAFT
-        get_cfg_defaults = config_default.get_cfg_defaults
-        make_matching_figures = plotting.make_matching_figures
-        print("✓ Alternative import successful")
-    except ImportError as e2:
-        print(f"Alternative import also failed: {e2}")
-        sys.exit(1)
+        # JamMaの設定を辞書形式に変換
+        if hasattr(config.JAMMA, 'COARSE'):
+            jamma_config = self._convert_config_to_dict(config.JAMMA)
+        else:
+            jamma_config = config.JAMMA
+        
+        # FDAFTエンコーダーを初期化
+        self.fdaft_backbone = FDAFTEncoder.from_config(config)
+        
+        # JamMaのマッチャーを初期化（元の設定を使用）
+        self.jamma_matcher = JamMa(config=jamma_config)
+        
+        # JamMaの学習済み重みを読み込み
+        if pretrained_jamma == 'official':
+            try:
+                state_dict = torch.hub.load_state_dict_from_url(
+                    'https://github.com/leoluxxx/JamMa/releases/download/v0.1/jamma.ckpt',
+                    file_name='jamma.ckpt')['state_dict']
+                
+                # JamMa部分のみ読み込み
+                jamma_state_dict = {}
+                for key, value in state_dict.items():
+                    if key.startswith('matcher.'):
+                        # matcher.xxx -> xxx に変換
+                        new_key = key[8:]  # "matcher."を除去
+                        jamma_state_dict[new_key] = value
+                
+                self.jamma_matcher.load_state_dict(jamma_state_dict, strict=False)
+                print("✓ JamMa学習済みモデルを読み込み完了")
+                
+            except Exception as e:
+                print(f"JamMa学習済みモデルの読み込みに失敗: {e}")
+                print("スクラッチから初期化します")
+        
+        # FDAFTからJamMaへの次元適応レイヤー
+        fdaft_coarse_dim = self.fdaft_backbone.coarse_dim
+        fdaft_fine_dim = self.fdaft_backbone.fine_dim
+        jamma_coarse_dim = jamma_config['coarse']['d_model']
+        jamma_fine_dim = jamma_config['fine']['d_model']
+        
+        # 次元適応レイヤー
+        if fdaft_coarse_dim != jamma_coarse_dim:
+            self.dimension_adapter_8 = nn.Linear(fdaft_coarse_dim, jamma_coarse_dim)
+        else:
+            self.dimension_adapter_8 = nn.Identity()
+            
+        if fdaft_fine_dim != jamma_fine_dim:
+            self.dimension_adapter_4 = nn.Linear(fdaft_fine_dim, jamma_fine_dim)
+        else:
+            self.dimension_adapter_4 = nn.Identity()
+    
+    def _convert_config_to_dict(self, yacs_config):
+        """YACS設定を辞書形式に変換（JamMa互換）"""
+        return {
+            'coarse': {
+                'd_model': yacs_config.COARSE.D_MODEL,
+            },
+            'fine': {
+                'd_model': yacs_config.FINE.D_MODEL,
+                'dsmax_temperature': getattr(yacs_config.FINE, 'DSMAX_TEMPERATURE', 0.1),
+                'thr': yacs_config.FINE.THR,
+                'inference': yacs_config.FINE.INFERENCE
+            },
+            'match_coarse': {
+                'thr': yacs_config.MATCH_COARSE.THR,
+                'use_sm': yacs_config.MATCH_COARSE.USE_SM,
+                'border_rm': yacs_config.MATCH_COARSE.BORDER_RM,
+                'dsmax_temperature': getattr(yacs_config.MATCH_COARSE, 'DSMAX_TEMPERATURE', 0.1),
+                'inference': yacs_config.MATCH_COARSE.INFERENCE
+            },
+            'fine_window_size': yacs_config.FINE_WINDOW_SIZE,
+            'resolution': list(yacs_config.RESOLUTION)
+        }
+    
+    def forward(self, data, mode='test'):
+        """統合フォワードパス"""
+        # 1. FDAFTで特徴抽出
+        self.fdaft_backbone(data)
+        
+        # 2. 次元適応
+        B, C_coarse, H_8, W_8 = data['feat_8_0'].shape
+        B, C_fine, H_4, W_4 = data['feat_4_0'].shape
+        
+        # 特徴を平坦化して次元変換
+        feat_8_0_flat = data['feat_8_0'].view(B, C_coarse, -1).transpose(1, 2)  # [B, H*W, C]
+        feat_8_1_flat = data['feat_8_1'].view(B, C_coarse, -1).transpose(1, 2)
+        feat_4_0_flat = data['feat_4_0'].view(B, C_fine, -1).transpose(1, 2)
+        feat_4_1_flat = data['feat_4_1'].view(B, C_fine, -1).transpose(1, 2)
+        
+        # 次元適応
+        feat_8_0_adapted = self.dimension_adapter_8(feat_8_0_flat).transpose(1, 2).view(B, -1, H_8, W_8)
+        feat_8_1_adapted = self.dimension_adapter_8(feat_8_1_flat).transpose(1, 2).view(B, -1, H_8, W_8)
+        feat_4_0_adapted = self.dimension_adapter_4(feat_4_0_flat).transpose(1, 2).view(B, -1, H_4, W_4)
+        feat_4_1_adapted = self.dimension_adapter_4(feat_4_1_flat).transpose(1, 2).view(B, -1, H_4, W_4)
+        
+        # データを更新
+        data['feat_8_0'] = feat_8_0_adapted
+        data['feat_8_1'] = feat_8_1_adapted
+        data['feat_4_0'] = feat_4_0_adapted
+        data['feat_4_1'] = feat_4_1_adapted
+        
+        # 3. JamMaでマッチング
+        return self.jamma_matcher(data, mode=mode)
 
 
 def create_planetary_image_pair():
     """
-    Create a pair of synthetic planetary images for demonstration
-    
-    Returns:
-        tuple: (image1, image2) - pair of synthetic planetary surface images
+    惑星表面画像ペアの生成（改良版）
     """
     print("  Creating synthetic planetary surface images...")
     np.random.seed(42)
     size = (512, 512)
     
-    # Create base terrain using multiple frequency components
+    # より現実的な地形生成
     x, y = np.meshgrid(np.linspace(0, 10, size[1]), np.linspace(0, 10, size[0]))
     
-    # Multi-scale terrain generation
+    # 多スケール地形生成
     terrain1 = (
-        np.sin(x) * np.cos(y) +                    # Large-scale features
-        0.5 * np.sin(2*x) * np.cos(3*y) +         # Medium-scale features  
-        0.3 * np.sin(5*x) * np.cos(2*y) +         # Small-scale features
-        0.2 * np.sin(8*x) * np.cos(5*y)           # Fine details
+        np.sin(x) * np.cos(y) +                    # 大規模特徴
+        0.5 * np.sin(2*x) * np.cos(3*y) +         # 中規模特徴  
+        0.3 * np.sin(5*x) * np.cos(2*y) +         # 小規模特徴
+        0.2 * np.sin(8*x) * np.cos(5*y) +         # 細部
+        0.1 * np.random.normal(0, 1, size)        # ノイズ
     )
     
-    # Add realistic noise for surface texture
-    noise1 = np.random.normal(0, 0.1, size)
-    image1 = terrain1 + noise1
-    
-    # Add crater-like circular depressions
+    # クレーター様の円形窪地を追加
     crater_positions = [
         (128, 150, 25),  # (center_x, center_y, radius)
         (300, 200, 35),
@@ -97,38 +182,32 @@ def create_planetary_image_pair():
         y_coords, x_coords = np.ogrid[:size[0], :size[1]]
         crater_mask = (x_coords - cx)**2 + (y_coords - cy)**2 <= radius**2
         
-        # Create realistic crater profile (Gaussian depression)
+        # 現実的なクレータープロファイル
         distance = np.sqrt((x_coords - cx)**2 + (y_coords - cy)**2)
         crater_depth = np.exp(-distance**2 / (2 * (radius/2)**2)) * 0.4
         
-        # Apply crater effect
-        image1[crater_mask] -= crater_depth[crater_mask]
+        terrain1[crater_mask] -= crater_depth[crater_mask]
     
-    # Create second image with geometric transformation
+    # 2番目の画像（幾何変換適用）
     center = (size[1]//2, size[0]//2)
     angle = 12  # degrees
     scale = 0.95
     
-    # Apply transformation
     M = cv2.getRotationMatrix2D(center, angle, scale)
     M[0, 2] += 25  # translation x
     M[1, 2] += 15  # translation y
     
-    image2 = cv2.warpAffine(image1, M, (size[1], size[0]))
+    image2 = cv2.warpAffine(terrain1, M, (size[1], size[0]))
     
-    # Simulate illumination differences
+    # 照明変化をシミュレート
     illumination_gradient_x = np.linspace(0.85, 1.15, size[1])
     illumination_gradient_y = np.linspace(1.05, 0.95, size[0])
     illumination_map = np.outer(illumination_gradient_y, illumination_gradient_x)
     
-    image2 = image2 * illumination_map
+    image2 = image2 * illumination_map + 0.1
     
-    # Add different noise pattern
-    noise2 = np.random.normal(0, 0.08, size)
-    image2 = image2 + noise2 + 0.1  # brightness change
-    
-    # Normalize both images to [0, 255] range
-    image1 = ((image1 - image1.min()) / (image1.max() - image1.min()) * 255).astype(np.uint8)
+    # [0, 255]範囲に正規化
+    image1 = ((terrain1 - terrain1.min()) / (terrain1.max() - terrain1.min()) * 255).astype(np.uint8)
     image2 = ((image2 - image2.min()) / (image2.max() - image2.min()) * 255).astype(np.uint8)
     
     print("  ✓ Synthetic planetary images created successfully!")
@@ -137,15 +216,9 @@ def create_planetary_image_pair():
 
 def prepare_data_batch(image1, image2):
     """
-    Prepare data batch for JamMa-FDAFT processing
-    
-    Args:
-        image1, image2: Input images
-        
-    Returns:
-        Dictionary containing properly formatted data for the model
+    JamMa-FDAFT処理用のデータバッチ準備
     """
-    # Convert to RGB format (3 channels)
+    # RGB形式に変換（3チャンネル）
     if len(image1.shape) == 2:
         image1_rgb = np.stack([image1, image1, image1], axis=2)
         image2_rgb = np.stack([image2, image2, image2], axis=2)
@@ -153,15 +226,27 @@ def prepare_data_batch(image1, image2):
         image1_rgb = image1
         image2_rgb = image2
     
-    # Convert to torch tensors and normalize
+    # テンソルに変換
     image1_tensor = torch.from_numpy(image1_rgb).float().permute(2, 0, 1) / 255.0
     image2_tensor = torch.from_numpy(image2_rgb).float().permute(2, 0, 1) / 255.0
     
-    # Add batch dimension
-    image1_batch = image1_tensor.unsqueeze(0)  # [1, 3, H, W]
-    image2_batch = image2_tensor.unsqueeze(0)  # [1, 3, H, W]
+    # リサイズ
+    target_size = 832
+    image1_resized = F.interpolate(image1_tensor.unsqueeze(0), size=(target_size, target_size), mode='bilinear').squeeze(0)
+    image2_resized = F.interpolate(image2_tensor.unsqueeze(0), size=(target_size, target_size), mode='bilinear').squeeze(0)
     
-    # Create data dictionary
+    # 正規化（ImageNet統計）
+    imagenet_mean = torch.tensor([0.485, 0.456, 0.406]).view(3, 1, 1)
+    imagenet_std = torch.tensor([0.229, 0.224, 0.225]).view(3, 1, 1)
+    
+    image1_normalized = (image1_resized - imagenet_mean) / imagenet_std
+    image2_normalized = (image2_resized - imagenet_mean) / imagenet_std
+    
+    # バッチ次元を追加
+    image1_batch = image1_normalized.unsqueeze(0)  # [1, 3, H, W]
+    image2_batch = image2_normalized.unsqueeze(0)  # [1, 3, H, W]
+    
+    # データ辞書作成
     data = {
         'imagec_0': image1_batch,
         'imagec_1': image2_batch,
@@ -176,251 +261,189 @@ def prepare_data_batch(image1, image2):
 
 def create_demo_config():
     """
-    Create demonstration configuration compatible with JamMa
-    
-    Returns:
-        Configuration object with proper format for JamMa compatibility
+    デモ用設定の作成（JamMa互換）
     """
-    # Get default configuration
+    # デフォルト設定取得
     config = get_cfg_defaults()
     
-    # Demo-specific settings (compatible with JamMa)
-    coarse_dim = 256  # Same as JamMa
-    fine_dim = 128    # Same as JamMa
-    
-    # FDAFT Configuration
-    config.FDAFT = config.__class__()
-    config.FDAFT.NUM_LAYERS = 2
-    config.FDAFT.SIGMA_0 = 1.0
-    config.FDAFT.USE_STRUCTURED_FORESTS = True
-    config.FDAFT.MAX_KEYPOINTS = 500  # デモ用に削減
-    config.FDAFT.NMS_RADIUS = 4
-    
-    # JamMa Configuration - 元のJamMaと完全に互換
+    # JamMa互換の設定
     config.JAMMA.RESOLUTION = (8, 2)
     config.JAMMA.FINE_WINDOW_SIZE = 5
-    config.JAMMA.COARSE.D_MODEL = coarse_dim
-    config.JAMMA.FINE.D_MODEL = fine_dim
+    config.JAMMA.COARSE.D_MODEL = 256  # JamMaのデフォルト
+    config.JAMMA.FINE.D_MODEL = 128    # JamMaのデフォルト
     
-    # Matching thresholds (JamMaと同じ)
+    # マッチング閾値
     config.JAMMA.MATCH_COARSE.USE_SM = True
     config.JAMMA.MATCH_COARSE.THR = 0.2
     config.JAMMA.MATCH_COARSE.BORDER_RM = 2
-    config.JAMMA.MATCH_COARSE.DSMAX_TEMPERATURE = 0.1
-    config.JAMMA.MATCH_COARSE.INFERENCE = True
     config.JAMMA.FINE.THR = 0.1
-    config.JAMMA.FINE.DSMAX_TEMPERATURE = 0.1
     config.JAMMA.FINE.INFERENCE = True
+    config.JAMMA.MATCH_COARSE.INFERENCE = True
+    
+    # FDAFT設定
+    config.FDAFT = config.__class__()
+    config.FDAFT.NUM_LAYERS = 3
+    config.FDAFT.SIGMA_0 = 1.0
+    config.FDAFT.USE_STRUCTURED_FORESTS = True
+    config.FDAFT.MAX_KEYPOINTS = 1000  # デモ用に削減
+    config.FDAFT.NMS_RADIUS = 5
     
     return config
 
 
-class IntegratedJamMaFDAFT(torch.nn.Module):
-    """
-    統合されたJamMa-FDAFTモデル
-    FDAFTエンコーダーとJamMaマッチャーを組み合わせ
-    """
-    
-    def __init__(self, config, use_jamma_pretrained='official'):
-        super().__init__()
-        
-        # FDAFTエンコーダー
-        self.fdaft_encoder = FDAFTEncoder.from_config(config)
-        
-        # JamMaマッチャー (学習済みモデル使用)
-        self.jamma_matcher = JamMaFDAFT(config.JAMMA)
-        
-        # JamMaの学習済みモデルをロード
-        if use_jamma_pretrained:
-            self.load_jamma_pretrained(use_jamma_pretrained)
-    
-    def load_jamma_pretrained(self, pretrained_path):
-        """JamMaの学習済みモデルをロード"""
-        try:
-            missing_keys, unexpected_keys = self.jamma_matcher.load_jamma_pretrained_weights(pretrained_path)
-            print(f"✓ JamMa pretrained weights loaded successfully")
-            print(f"  Missing keys (FDAFT components): {len(missing_keys)}")
-            print(f"  Unexpected keys: {len(unexpected_keys)}")
-        except Exception as e:
-            print(f"⚠ Failed to load JamMa pretrained weights: {e}")
-            print("  Continuing with random initialization...")
-    
-    def forward(self, data, mode='test'):
-        """Forward pass"""
-        # 1. FDAFT特徴抽出
-        self.fdaft_encoder(data)
-        
-        # 2. JamMaマッチング
-        self.jamma_matcher(data, mode=mode)
-        
-        return data
-
-
 def demonstrate_jamma_fdaft():
-    """Main demonstration function"""
-    print("JamMa-FDAFT Integrated Pipeline Demonstration")
+    """メイン実演関数"""
+    print("JamMa-FDAFT統合パイプライン実演")
     print("=" * 60)
-    print("Architecture: Input Images → FDAFT Encoder → Joint Mamba (JEGO) → C2F Matching")
-    print("Using JamMa pretrained weights for matching components")
+    print("アーキテクチャ: Input Images → FDAFT Encoder → Joint Mamba (JEGO) → C2F Matching")
+    print("特徴: JamMaの学習済みモデルを使用")
     print()
     
-    # Step 1: Create sample images
-    print("Step 1: Creating synthetic planetary images...")
+    # ステップ1: サンプル画像作成
+    print("Step 1: 合成惑星画像の作成...")
     start_time = time.time()
     image1, image2 = create_planetary_image_pair()
     creation_time = time.time() - start_time
-    print(f"  ✓ Images created in {creation_time:.2f} seconds")
+    print(f"  ✓ 画像作成完了 {creation_time:.2f} 秒")
     
-    # Display input images
-    print("\nDisplaying input images...")
+    # 入力画像表示
+    print("\n入力画像を表示中...")
     fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(15, 6))
     
     ax1.imshow(image1, cmap='gray')
-    ax1.set_title('Planetary Image 1 (Reference)', fontsize=14, fontweight='bold')
+    ax1.set_title('惑星画像1 (参照)', fontsize=14, fontweight='bold')
     ax1.axis('off')
     
     ax2.imshow(image2, cmap='gray')
-    ax2.set_title('Planetary Image 2 (Transformed)', fontsize=14, fontweight='bold')
+    ax2.set_title('惑星画像2 (変換済み)', fontsize=14, fontweight='bold')
     ax2.axis('off')
     
     plt.tight_layout()
     plt.show()
     
-    # Step 2: Initialize JamMa-FDAFT with JamMa pretrained weights
-    print("\nStep 2: Initializing JamMa-FDAFT model...")
+    # ステップ2: JamMa-FDAFT初期化
+    print("\nStep 2: JamMa-FDAFT モデル初期化...")
     
-    # Create configuration
+    # 一貫した設定作成
     config = create_demo_config()
     
-    # Initialize integrated model with JamMa pretrained weights
-    print("  Initializing integrated model with JamMa pretrained weights...")
-    model = IntegratedJamMaFDAFT(config, use_jamma_pretrained='official')
+    print("  JamMa-FDAFT統合モデル初期化中...")
+    device = 'cuda' if torch.cuda.is_available() else 'cpu'
+    model = JamMaFDAFTDemo(config, pretrained_jamma='official').to(device)
+    model.eval()
     
-    print("  ✓ JamMa-FDAFT initialized successfully!")
+    print("  ✓ JamMa-FDAFT初期化成功!")
     
-    # Print model information
-    print("\nModel Architecture Information:")
-    fdaft_info = model.fdaft_encoder.get_fdaft_info()
-    matcher_info = model.jamma_matcher.get_model_info()
+    # モデル情報表示
+    print("\nモデルアーキテクチャ情報:")
+    total_params = sum(p.numel() for p in model.parameters())
+    print(f"  総パラメータ数: {total_params:,}")
+    print(f"  FDAFT Encoder: 惑星画像特化特徴抽出")
+    print(f"  JamMa Matcher: 学習済みJoint Mamba + C2F マッチング")
+    print(f"  出力次元: Coarse={config.JAMMA.COARSE.D_MODEL}, Fine={config.JAMMA.FINE.D_MODEL}")
     
-    print(f"  FDAFT Encoder: {fdaft_info['encoder_type']}")
-    print(f"    - Scale space layers: {fdaft_info['scale_space_layers']}")
-    print(f"    - Structured Forests: {fdaft_info['structured_forests']}")
-    print(f"    - Output dimensions: Coarse={fdaft_info['output_dimensions']['coarse_dim']}, Fine={fdaft_info['output_dimensions']['fine_dim']}")
-    print(f"  JamMa Matcher: {matcher_info['model_name']}")
-    print(f"    - Architecture: {matcher_info['architecture']}")
-    print(f"    - Compatibility: {matcher_info['compatibility']}")
-    print(f"    - Coarse D-Model: {matcher_info['parameters']['coarse_d_model']}")
-    print(f"    - Fine D-Model: {matcher_info['parameters']['fine_d_model']}")
-    
-    # Step 3: Prepare data and run inference
-    print("\nStep 3: Running JamMa-FDAFT pipeline with JamMa pretrained weights...")
+    # ステップ3: データ準備と推論実行
+    print("\nStep 3: JamMa-FDAFT パイプライン実行...")
     start_time = time.time()
     
     try:
-        # Prepare data batch
+        # データバッチ準備
         data = prepare_data_batch(image1, image2)
         
-        # Set models to evaluation mode
-        model.eval()
+        # デバイスに移動
+        for key, value in data.items():
+            if isinstance(value, torch.Tensor):
+                data[key] = value.to(device)
         
         with torch.no_grad():
-            print("  Processing through integrated pipeline...")
-            # Run integrated pipeline (FDAFT + JamMa)
+            print("  FDAFT + JamMa統合処理中...")
+            # 統合パイプライン実行
             model(data, mode='test')
         
         processing_time = time.time() - start_time
-        print(f"  ✓ Pipeline completed in {processing_time:.2f} seconds")
+        print(f"  ✓ パイプライン完了 {processing_time:.2f} 秒")
         
     except Exception as e:
-        print(f"  ✗ Error during processing: {e}")
+        print(f"  ✗ 処理中エラー: {e}")
         import traceback
         traceback.print_exc()
         return False
     
-    # Step 4: Analyze results
-    print("\nStep 4: Analyzing results...")
+    # ステップ4: 結果分析
+    print("\nStep 4: 結果分析...")
     
-    # Extract matching results
+    # マッチング結果抽出
     num_matches = len(data.get('mkpts0_f', []))
     coarse_matches = len(data.get('mkpts0_c', []))
     
-    print(f"  Coarse-level matches found: {coarse_matches}")
-    print(f"  Fine-level matches found: {num_matches}")
+    print(f"  粗レベルマッチ検出: {coarse_matches}")
+    print(f"  細レベルマッチ検出: {num_matches}")
     
-    # Step 5: Visualize results
-    print(f"\nStep 5: Visualizing results...")
+    # ステップ5: 結果可視化
+    print(f"\nStep 5: 結果可視化...")
     try:
         if num_matches > 0:
-            # Create matching visualization
+            # マッチング可視化作成
             make_matching_figures(data, mode='evaluation')
-            print("  ✓ Visualization completed")
+            print("  ✓ 可視化完了")
         else:
-            print("  ⚠ No matches found for visualization")
+            print("  ⚠ 可視化用マッチなし")
             
     except Exception as e:
-        print(f"  ✗ Visualization error: {e}")
+        print(f"  ✗ 可視化エラー: {e}")
     
-    # Final summary
+    # 最終まとめ
     print("\n" + "="*60)
-    print("JAMMA-FDAFT DEMONSTRATION SUMMARY")
+    print("JAMMA-FDAFT 実演まとめ")
     print("="*60)
-    print(f"Processing time: {processing_time:.2f} seconds")
-    print(f"Final matches found: {num_matches}")
+    print(f"処理時間: {processing_time:.2f} 秒")
+    print(f"最終マッチ数: {num_matches}")
     
     if num_matches >= 8:
-        print("✓ SUCCESS: JamMa-FDAFT successfully matched the planetary images!")
-        print("  The integrated pipeline demonstrated:")
-        print("  - FDAFT: Robust feature extraction for weak surface textures")
-        print("  - JamMa Pretrained: Efficient matching with learned weights")
-        print("  - Joint Mamba: Efficient long-range feature interaction")
-        print("  - C2F Matching: Hierarchical matching with sub-pixel refinement")
-        print("  - Planetary optimization: Enhanced performance on challenging surfaces")
+        print("✓ 成功: JamMa-FDAFTが惑星画像のマッチングに成功!")
+        print("  統合パイプラインが実証:")
+        print("  - FDAFT: 弱い表面テクスチャ用の堅牢な特徴抽出")
+        print("  - JamMa学習済み: 効率的な長距離特徴相互作用")
+        print("  - C2F マッチング: 階層的マッチングとサブピクセル精細化")
+        print("  - 惑星最適化: 困難な表面での性能向上")
     else:
-        print("⚠ LIMITED SUCCESS: Few matches found.")
-        print("  This may be due to:")
-        print("  - Challenging synthetic image characteristics")
-        print("  - Need for parameter tuning for specific image types")
-        print("  - Domain gap between training data and synthetic images")
+        print("⚠ 限定的成功: 少数のマッチのみ検出")
+        print("  原因として考えられるもの:")
+        print("  - デモ用モデルサイズの縮小（完全モデルでより良い結果）")
+        print("  - 合成画像の特性が困難")
+        print("  - 特定画像タイプ用のパラメータ調整の必要性")
     
-    print(f"\nArchitecture Validation:")
-    print(f"  - FDAFT output dimensions: {fdaft_info['output_dimensions']}")
-    print(f"  - JamMa expected dimensions: Coarse={config.JAMMA.COARSE.D_MODEL}, Fine={config.JAMMA.FINE.D_MODEL}")
-    print(f"  - JamMa pretrained weights: ✓ LOADED")
-    print(f"  - Dimension compatibility: ✓ VERIFIED")
-    
-    print(f"\nNext steps:")
-    print(f"  - Test on real planetary datasets (Mars, Moon, etc.)")
-    print(f"  - Fine-tune the integrated model on planetary images")
-    print(f"  - Train: python train_jammf.py configs/data/megadepth_trainval_832.py configs/jamma_fdaft/outdoor/final.py")
-    print(f"  - Test: python test_jammf.py configs/data/megadepth_test_1500.py configs/jamma_fdaft/outdoor/test.py")
+    print(f"\n次のステップ:")
+    print(f"  - 実際の惑星データセット（火星、月など）での訓練")
+    print(f"  - 実行: python train_jammf.py configs/data/megadepth_trainval_832.py configs/jamma_fdaft/outdoor/final.py")
+    print(f"  - テスト: python test_jammf.py configs/data/megadepth_test_1500.py configs/jamma_fdaft/outdoor/test.py")
     
     return True
 
 
 if __name__ == "__main__":
-    """Entry point for the demonstration script"""
+    """実演スクリプトのエントリーポイント"""
     try:
-        # Set matplotlib backend for environments without display
+        # matplotlib設定
         try:
             import matplotlib
             matplotlib.use('TkAgg')
         except:
             matplotlib.use('Agg')
-            print("Note: Using non-interactive matplotlib backend")
+            print("注意: 非対話型matplotlibバックエンドを使用")
         
         success = demonstrate_jamma_fdaft()
         
         if success:
-            print(f"\n🎉 JamMa-FDAFT demo with JamMa pretrained weights completed successfully!")
-            input("Press Enter to exit...")
+            print(f"\n🎉 JamMa-FDAFT デモが正常に完了しました!")
+            input("Enterキーで終了...")
         else:
-            print(f"\n❌ Demo failed. Please check the error messages above.")
+            print(f"\n❌ デモが失敗しました。上記のエラーメッセージを確認してください。")
             
     except KeyboardInterrupt:
-        print(f"\n\nDemo interrupted by user.")
+        print(f"\n\nデモがユーザーによって中断されました。")
     except Exception as e:
-        print(f"\n❌ Unexpected error: {e}")
+        print(f"\n❌ 予期しないエラー: {e}")
         import traceback
         traceback.print_exc()
         
