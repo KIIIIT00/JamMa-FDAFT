@@ -2,9 +2,11 @@
 修正されたJamMa-FDAFT Complete Demonstration Script
 
 主な修正点：
-- 設定の形式変換を修正
-- JamMaクラスとの互換性を確保
-- エラーハンドリングを改善
+- JamMaの学習済みモデル使用対応
+- 設定の整合性を確保
+- FDAFTエンコーダーとJamMa次元の適合性向上
+- 統合パイプラインの安定化
+- マスクサイズの修正
 """
 
 import sys
@@ -73,7 +75,6 @@ class JamMaFDAFTDemo(nn.Module):
         
         # JamMaの学習済みモデルを読み込み
         try:
-            self.jamma_backbone = CovNextV2_nano()
             # 辞書形式の設定をJamMaに渡す
             self.jamma_matcher = JamMa(config=self.jamma_config, profiler=None)
             print("✅ JamMaマッチャー初期化完了")
@@ -159,7 +160,7 @@ class JamMaFDAFTDemo(nn.Module):
                     'd_model': 256,
                 },
                 'fine': {
-                    'd_model': 128,
+                    'd_model': 64,
                     'dsmax_temperature': 0.1,
                     'thr': 0.1,
                     'inference': True
@@ -180,13 +181,8 @@ class JamMaFDAFTDemo(nn.Module):
     def forward(self, data):
         """統合フォワードパス"""
         try:
-            # 1. バックボーンで特徴抽出
-            if hasattr(self.fdaft_backbone, 'forward_features_8'):
-                # FDAFTバックボーン
-                self.fdaft_backbone(data)
-            else:
-                # ConvNextV2バックボーン（フォールバック）
-                self.jamma_backbone(data)
+            # 1. FDAFTで特徴抽出
+            self.fdaft_backbone(data)
             
             # 2. 次元適応
             if 'feat_8_0' in data and 'feat_8_1' in data:
@@ -304,12 +300,28 @@ def prepare_data_batch(image1, image2):
             os.unlink(tmp1.name)
             os.unlink(tmp2.name)
     
+    # マスクサイズを修正（coarseレベル用）
+    coarse_scale = 0.125  # 1/8 scale
+    if mask1 is not None and mask2 is not None:
+        mask1_coarse = F.interpolate(
+            mask1.unsqueeze(0).float(), 
+            scale_factor=coarse_scale, 
+            mode='nearest'
+        ).squeeze(0).bool()
+        mask2_coarse = F.interpolate(
+            mask2.unsqueeze(0).float(), 
+            scale_factor=coarse_scale, 
+            mode='nearest'
+        ).squeeze(0).bool()
+    else:
+        mask1_coarse = mask2_coarse = None
+    
     # データ辞書作成
     data = {
         'imagec_0': image1_tensor,
         'imagec_1': image2_tensor,
-        'mask0': mask1,
-        'mask1': mask2,
+        'mask0': mask1_coarse,  # coarseレベルのマスク
+        'mask1': mask2_coarse,  # coarseレベルのマスク
         'dataset_name': ['JamMa-FDAFT-Demo'],
         'scene_id': 'demo_scene',
         'pair_id': 0,
@@ -330,7 +342,7 @@ def create_demo_config():
     config.JAMMA.RESOLUTION = (8, 2)
     config.JAMMA.FINE_WINDOW_SIZE = 5
     config.JAMMA.COARSE.D_MODEL = 256  # JamMaのデフォルト
-    config.JAMMA.FINE.D_MODEL = 128    # JamMaのデフォルト
+    config.JAMMA.FINE.D_MODEL = 64    # JamMaのデフォルト
     
     # マッチング閾値
     config.JAMMA.MATCH_COARSE.USE_SM = True
@@ -340,15 +352,6 @@ def create_demo_config():
     config.JAMMA.FINE.INFERENCE = True
     config.JAMMA.MATCH_COARSE.INFERENCE = True
     
-    # FDAFT設定
-    if not hasattr(config, 'FDAFT'):
-        config.FDAFT = config.__class__()
-    config.FDAFT.NUM_LAYERS = 3
-    config.FDAFT.SIGMA_0 = 1.0
-    config.FDAFT.USE_STRUCTURED_FORESTS = True
-    config.FDAFT.MAX_KEYPOINTS = 1000  # デモ用に削減
-    config.FDAFT.NMS_RADIUS = 5
-    
     return config
 
 
@@ -357,7 +360,7 @@ def demonstrate_jamma_fdaft():
     print("🚀 JamMa-FDAFT統合パイプライン実演")
     print("=" * 60)
     print("アーキテクチャ: Input Images → FDAFT Encoder → Joint Mamba (JEGO) → C2F Matching")
-    print("特徴: JamMaの学習済みモデルを使用")
+    print("特徴: FDAFTエンコーダー + JamMaの学習済みマッチング")
     print()
     
     # ステップ1: サンプル画像作成
@@ -424,14 +427,14 @@ def demonstrate_jamma_fdaft():
     try:
         total_params = sum(p.numel() for p in model.parameters())
         print(f"  総パラメータ数: {total_params:,}")
-        print(f"  FDAFT Encoder: 惑星画像特化特徴抽出")
-        print(f"  JamMa Matcher: 学習済みJoint Mamba + C2F マッチング")
+        print(f"  Backbone: FDAFT Encoder (惑星画像特化)")
+        print(f"  Matcher: 学習済みJoint Mamba + C2F マッチング")
         print(f"  出力次元: Coarse={config.JAMMA.COARSE.D_MODEL}, Fine={config.JAMMA.FINE.D_MODEL}")
     except Exception as e:
         print(f"  ⚠️ モデル情報取得エラー: {e}")
     
     # ステップ3: データ準備と推論実行
-    print("\nStep 3: JamMa-FDAFT パイプライン実行...")
+    print("\nStep 3: JamMa パイプライン実行...")
     start_time = time.time()
     
     try:
@@ -489,29 +492,28 @@ def demonstrate_jamma_fdaft():
     
     # 最終まとめ
     print("\n" + "="*60)
-    print("🎊 JAMMA-FDAFT 実演まとめ")
+    print("🎊 JAMMA-FDAFT デモ実演まとめ")
     print("="*60)
     print(f"処理時間: {processing_time:.2f} 秒")
     print(f"最終マッチ数: {num_matches}")
     
     if num_matches >= 8:
-        print("✅ 成功: JamMa-FDAFTが惑星画像のマッチングに成功!")
-        print("  統合パイプラインが実証:")
-        print("  - FDAFT: 弱い表面テクスチャ用の堅牢な特徴抽出")
-        print("  - JamMa学習済み: 効率的な長距離特徴相互作用")
+        print("✅ 成功: JamMa-FDAFTが画像のマッチングに成功!")
+        print("  パイプラインが実証:")
+        print("  - FDAFT: 惑星画像特化の堅牢な特徴抽出")
+        print("  - Joint Mamba: 効率的な長距離特徴相互作用")
         print("  - C2F マッチング: 階層的マッチングとサブピクセル精細化")
-        print("  - 惑星最適化: 困難な表面での性能向上")
     else:
         print("⚠️ 限定的成功: 少数のマッチのみ検出")
         print("  原因として考えられるもの:")
-        print("  - デモ用モデルサイズの縮小（完全モデルでより良い結果）")
+        print("  - デモ用モデルサイズの縮小")
         print("  - 合成画像の特性が困難")
         print("  - 特定画像タイプ用のパラメータ調整の必要性")
     
     print(f"\n🚀 次のステップ:")
-    print(f"  - 実際の惑星データセット（火星、月など）での訓練")
-    print(f"  - 実行: python train_jammf.py configs/data/megadepth_trainval_832.py configs/jamma_fdaft/outdoor/final.py")
-    print(f"  - テスト: python test_jammf.py configs/data/megadepth_test_1500.py configs/jamma_fdaft/outdoor/test.py")
+    print(f"  - 実際のデータセット（MegaDepth、ScanNetなど）での訓練")
+    print(f"  - 実行: python train.py configs/data/megadepth_trainval_832.py configs/jamma/outdoor/final.py")
+    print(f"  - テスト: python test.py configs/data/megadepth_test_1500.py configs/jamma/outdoor/test.py")
     
     return True
 
