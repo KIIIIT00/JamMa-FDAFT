@@ -5,6 +5,7 @@
 - FDAFTエンコーダーの出力次元とJamMaの期待次元の適切な適合
 - 次元適応レイヤーの修正
 - エラーハンドリングの改善
+- NameErrorの修正
 """
 
 import sys
@@ -59,9 +60,6 @@ class JamMaFDAFTDemo(nn.Module):
         
         print("🔧 JamMa-FDAFTデモモデルを初期化中...")
         
-        # データバッチ準備（マスクなしで安全に実行）
-        print("  📦 データバッチを準備中...")
-        data = prepare_data_batch(image1, image2, use_masks=False)
         self.jamma_config = self._convert_config_to_dict(config)
         
         # FDAFTエンコーダーを初期化
@@ -398,7 +396,6 @@ def prepare_data_batch(image1, image2, use_masks=False):
     
     # 一時的にダミーファイルを作成してread_megadepth_colorを使用
     import tempfile
-    import cv2
     
     with tempfile.NamedTemporaryFile(suffix='.jpg', delete=False) as tmp1, \
          tempfile.NamedTemporaryFile(suffix='.jpg', delete=False) as tmp2:
