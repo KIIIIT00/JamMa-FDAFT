@@ -1,8 +1,10 @@
 """
 修正されたFDAFT Backbone Encoder
 
-設定に基づいて出力次元を動的に調整し、異なる解像度の画像にも対応
-JamMaの学習済みモデルとの互換性を確保
+主な修正点：
+- forward メソッドで正しい4次元特徴量形状を保持
+- JamMaとの互換性を確保
+- グリッド座標の正しい生成
 """
 
 import torch
@@ -22,9 +24,8 @@ class FDAFTEncoder(nn.Module):
     
     修正点：
     - JamMaの学習済みモデルとの互換性を確保
-    - 設定に基づいて出力次元を動的に調整
-    - 異なる解像度の画像に対応
-    - より柔軟な特徴変換ネットワーク
+    - 正しい4次元特徴量形状の維持
+    - 適切なグリッド座標の生成
     """
     
     def __init__(self, 
@@ -255,8 +256,8 @@ class FDAFTEncoder(nn.Module):
             data: Dictionary containing image batch and metadata
             
         Updates data with:
-            - feat_8_0, feat_8_1: Features at 1/8 resolution
-            - feat_4_0, feat_4_1: Features at 1/4 resolution  
+            - feat_8_0, feat_8_1: Features at 1/8 resolution [B, C, H/8, W/8]
+            - feat_4_0, feat_4_1: Features at 1/4 resolution [B, C, H/4, W/4]
             - grid_8: Coordinate grids for position encoding
             - Feature dimensions and metadata (JamMa互換)
         """
@@ -308,10 +309,17 @@ class FDAFTEncoder(nn.Module):
         feat_8_0, feat_8_1 = torch.chunk(feat_8_processed, 2, dim=0)  # [B, coarse_dim, H/8, W/8]
         feat_4_0, feat_4_1 = torch.chunk(feat_4_processed, 2, dim=0)  # [B, fine_dim, H/4, W/4]
         
+        # 重要：4次元形状を保持する（JamMa互換）
+        # JamMaのbackbone.pyと同じ形状にする
+        assert feat_8_0.dim() == 4, f"feat_8_0 should be 4D, got {feat_8_0.dim()}D: {feat_8_0.shape}"
+        assert feat_4_0.dim() == 4, f"feat_4_0 should be 4D, got {feat_4_0.dim()}D: {feat_4_0.shape}"
+        
         # Create coordinate grids for position encoding (JamMa互換)
         scale = 8
         h_8, w_8 = H // scale, W // scale
         device = data['imagec_0'].device
+        
+        # JamMaのbackbone.pyと同じ方法でグリッドを作成
         grid = [rearrange(
             (create_meshgrid(h_8, w_8, False, device) * scale).squeeze(0), 
             'h w t->(h w) t'
@@ -325,12 +333,17 @@ class FDAFTEncoder(nn.Module):
             'h_8': h_8,
             'w_8': w_8,
             'hw_8': h_8 * w_8,
-            'feat_8_0': feat_8_0,
-            'feat_8_1': feat_8_1,
-            'feat_4_0': feat_4_0,
-            'feat_4_1': feat_4_1,
-            'grid_8': grid_8,
+            'feat_8_0': feat_8_0,    # [B, C, H/8, W/8] - 4次元を保持
+            'feat_8_1': feat_8_1,    # [B, C, H/8, W/8] - 4次元を保持
+            'feat_4_0': feat_4_0,    # [B, C, H/4, W/4] - 4次元を保持
+            'feat_4_1': feat_4_1,    # [B, C, H/4, W/4] - 4次元を保持
+            'grid_8': grid_8,        # [B, H*W, 2]
         })
+        
+        print(f"  🔍 FDAFT特徴量形状確認:")
+        print(f"    feat_8_0: {feat_8_0.shape}")
+        print(f"    feat_4_0: {feat_4_0.shape}")
+        print(f"    grid_8: {grid_8.shape}")
         
     def get_fdaft_info(self):
         """

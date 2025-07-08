@@ -2,11 +2,9 @@
 修正されたJamMa-FDAFT Complete Demonstration Script
 
 主な修正点：
-- JamMaの学習済みモデル使用対応
-- 設定の整合性を確保
-- FDAFTエンコーダーとJamMa次元の適合性向上
-- 統合パイプラインの安定化
-- マスクサイズの修正
+- FDAFTエンコーダーの出力次元とJamMaの期待次元の適切な適合
+- 次元適応レイヤーの修正
+- エラーハンドリングの改善
 """
 
 import sys
@@ -50,8 +48,9 @@ except ImportError as e:
 
 class JamMaFDAFTDemo(nn.Module):
     """
-    JamMa-FDAFT統合モデル（デモ用）
+    JamMa-FDAFT統合モデル（デモ用）修正版
     FDAFTエンコーダー + JamMaの学習済みモデルを組み合わせ
+    次元の不一致問題を解決
     """
     
     def __init__(self, config, pretrained_jamma='official'):
@@ -60,10 +59,12 @@ class JamMaFDAFTDemo(nn.Module):
         
         print("🔧 JamMa-FDAFTデモモデルを初期化中...")
         
-        # 設定を辞書形式に変換（JamMa互換）
+        # データバッチ準備（マスクなしで安全に実行）
+        print("  📦 データバッチを準備中...")
+        data = prepare_data_batch(image1, image2, use_masks=False)
         self.jamma_config = self._convert_config_to_dict(config)
         
-        # FDAFTエンコーダーを初期化（JamMaの次元に合わせる）
+        # FDAFTエンコーダーを初期化
         try:
             self.fdaft_backbone = FDAFTEncoder.from_config(config)
             print("✅ FDAFTバックボーン初期化完了")
@@ -105,21 +106,11 @@ class JamMaFDAFTDemo(nn.Module):
                 print(f"⚠️ JamMa学習済みモデルの読み込みに失敗: {e}")
                 print("🔄 スクラッチから初期化します")
         
-        # 次元適応レイヤー（FDAFTからJamMaへの橋渡し）
-        fdaft_dim = 256  # FDAFT出力次元
-        jamma_dim = 256  # JamMa期待次元
-        
-        self.dimension_adapter_8 = nn.Sequential(
-            nn.Conv2d(fdaft_dim, jamma_dim, kernel_size=1),
-            nn.BatchNorm2d(jamma_dim),
-            nn.ReLU(inplace=True)
-        ) if fdaft_dim != jamma_dim else nn.Identity()
-        
-        self.dimension_adapter_4 = nn.Sequential(
-            nn.Conv2d(128, 128, kernel_size=1),  # Fine level adaptation
-            nn.BatchNorm2d(128),
-            nn.ReLU(inplace=True)
-        )
+        # 動的次元適応レイヤー（実際の特徴量サイズに基づいて調整）
+        # これらのレイヤーは最初のforward時に初期化される
+        self.dimension_adapter_8 = None
+        self.dimension_adapter_4 = None
+        self._adapters_initialized = False
     
     def _convert_config_to_dict(self, yacs_config):
         """YACS設定を辞書形式に変換してJamMa互換にする"""
@@ -178,26 +169,150 @@ class JamMaFDAFTDemo(nn.Module):
                 'resolution': [8, 2]
             }
     
+    def _initialize_adapters(self, feat_8_shape, feat_4_shape):
+        """実際の特徴量サイズに基づいて次元適応レイヤーを初期化"""
+        print(f"🔧 次元適応レイヤーを初期化中...")
+        print(f"  feat_8 shape: {feat_8_shape}")
+        print(f"  feat_4 shape: {feat_4_shape}")
+        
+        # Coarse features (1/8 resolution) の次元適応
+        fdaft_8_dim = feat_8_shape[1]  # チャンネル数を取得
+        jamma_8_dim = self.jamma_config['coarse']['d_model']  # 256
+        
+        if fdaft_8_dim != jamma_8_dim:
+            self.dimension_adapter_8 = nn.Sequential(
+                nn.Conv2d(fdaft_8_dim, jamma_8_dim, kernel_size=1),
+                nn.BatchNorm2d(jamma_8_dim),
+                nn.GELU()
+            ).to(next(self.parameters()).device)
+            print(f"  ✅ Coarse adapter: {fdaft_8_dim} -> {jamma_8_dim}")
+        else:
+            self.dimension_adapter_8 = nn.Identity()
+            print(f"  ✅ Coarse adapter: Identity (dimensions match)")
+        
+        # Fine features (1/4 resolution) の次元適応
+        fdaft_4_dim = feat_4_shape[1]
+        jamma_4_dim = self.jamma_config['fine']['d_model']  # 64
+        
+        if fdaft_4_dim != jamma_4_dim:
+            self.dimension_adapter_4 = nn.Sequential(
+                nn.Conv2d(fdaft_4_dim, jamma_4_dim, kernel_size=1),
+                nn.BatchNorm2d(jamma_4_dim),
+                nn.GELU()
+            ).to(next(self.parameters()).device)
+            print(f"  ✅ Fine adapter: {fdaft_4_dim} -> {jamma_4_dim}")
+        else:
+            self.dimension_adapter_4 = nn.Identity()
+            print(f"  ✅ Fine adapter: Identity (dimensions match)")
+        
+        self._adapters_initialized = True
+    
     def forward(self, data):
         """統合フォワードパス"""
         try:
+            print("  🔄 FDAFTによる特徴抽出開始...")
             # 1. FDAFTで特徴抽出
             self.fdaft_backbone(data)
             
-            # 2. 次元適応
+            # 2. 次元適応レイヤーの初期化（最初の呼び出し時のみ）
+            if not self._adapters_initialized:
+                if 'feat_8_0' in data and 'feat_4_0' in data:
+                    self._initialize_adapters(data['feat_8_0'].shape, data['feat_4_0'].shape)
+                else:
+                    raise RuntimeError("FDAFT backbone did not produce expected features")
+            
+            print("  🔄 次元適応処理中...")
+            # 3. 次元適応
             if 'feat_8_0' in data and 'feat_8_1' in data:
+                original_shape_8 = data['feat_8_0'].shape
                 data['feat_8_0'] = self.dimension_adapter_8(data['feat_8_0'])
                 data['feat_8_1'] = self.dimension_adapter_8(data['feat_8_1'])
+                print(f"    feat_8: {original_shape_8} -> {data['feat_8_0'].shape}")
             
             if 'feat_4_0' in data and 'feat_4_1' in data:
+                original_shape_4 = data['feat_4_0'].shape
                 data['feat_4_0'] = self.dimension_adapter_4(data['feat_4_0'])
                 data['feat_4_1'] = self.dimension_adapter_4(data['feat_4_1'])
+                print(f"    feat_4: {original_shape_4} -> {data['feat_4_0'].shape}")
             
-            # 3. JamMaでマッチング
+            # デバッグ: マッチング前の特徴量とマスクの形状確認
+            print("  🔍 JamMaマッチング前の確認:")
+            print(f"    feat_8_0: {data['feat_8_0'].shape}")
+            print(f"    feat_8_1: {data['feat_8_1'].shape}")
+            if 'mask0' in data and data['mask0'] is not None:
+                print(f"    mask0: {data['mask0'].shape}")
+                print(f"    mask1: {data['mask1'].shape}")
+                
+                # JamMaの処理に合わせてflat化した際のサイズを予測
+                b, c, h, w = data['feat_8_0'].shape
+                hw = h * w
+                print(f"    予想される flatten size: {hw}")
+                print(f"    mask flatten size: {data['mask0'].numel()}")
+                
+                # マスクのサイズが特徴量と一致するか確認
+                expected_mask_shape = (b, h, w)  # [B, H, W]
+                if data['mask0'].shape != expected_mask_shape:
+                    print(f"    ⚠️ マスクサイズ不一致! 期待: {expected_mask_shape}, 実際: {data['mask0'].shape}")
+                    # マスクを正しいサイズにリサイズ
+                    
+                    # マスクの次元を確認して適切に処理
+                    mask0 = data['mask0']
+                    mask1 = data['mask1']
+                    
+                    # 3次元の場合: [B, H, W] -> 必要に応じてリサイズ
+                    if mask0.dim() == 3 and mask0.shape != expected_mask_shape:
+                        mask0 = F.interpolate(
+                            mask0.float().unsqueeze(1),  # [B, 1, H, W]
+                            size=(h, w),
+                            mode='nearest'
+                        ).squeeze(1).bool()  # [B, H, W]
+                        
+                        mask1 = F.interpolate(
+                            mask1.float().unsqueeze(1),  # [B, 1, H, W]
+                            size=(h, w),
+                            mode='nearest'
+                        ).squeeze(1).bool()  # [B, H, W]
+                    
+                    # 2次元の場合: [H, W] -> [B, H, W]
+                    elif mask0.dim() == 2:
+                        # バッチ次元を追加してリサイズ
+                        mask0 = F.interpolate(
+                            mask0.float().unsqueeze(0).unsqueeze(0),  # [1, 1, H, W]
+                            size=(h, w),
+                            mode='nearest'
+                        ).squeeze(0).bool()  # [H, W]
+                        mask0 = mask0.unsqueeze(0).repeat(b, 1, 1)  # [B, H, W]
+                        
+                        mask1 = F.interpolate(
+                            mask1.float().unsqueeze(0).unsqueeze(0),  # [1, 1, H, W]
+                            size=(h, w),
+                            mode='nearest'
+                        ).squeeze(0).bool()  # [H, W]
+                        mask1 = mask1.unsqueeze(0).repeat(b, 1, 1)  # [B, H, W]
+                    
+                    data['mask0'] = mask0
+                    data['mask1'] = mask1
+                    print(f"    ✅ マスクを修正: {mask0.shape}")
+                else:
+                    print(f"    ✅ マスクサイズ正常: {data['mask0'].shape}")
+            else:
+                print("    マスクなし")
+            
+            print("  🔄 JamMaマッチング処理開始...")
+            # 4. JamMaでマッチング
             return self.jamma_matcher(data, mode='test')
             
         except Exception as e:
             print(f"❌ フォワードパス中にエラー: {e}")
+            # デバッグ情報を出力
+            print("  🔍 詳細なデバッグ情報:")
+            for key in ['feat_8_0', 'feat_8_1', 'feat_4_0', 'feat_4_1', 'mask0', 'mask1', 'h_8', 'w_8', 'hw_8']:
+                if key in data:
+                    value = data[key]
+                    if hasattr(value, 'shape'):
+                        print(f"    {key}: {value.shape}")
+                    else:
+                        print(f"    {key}: {value} (type: {type(value)})")
             raise
 
 
@@ -265,9 +380,13 @@ def create_planetary_image_pair():
     return image1, image2
 
 
-def prepare_data_batch(image1, image2):
+def prepare_data_batch(image1, image2, use_masks=False):
     """
-    JamMa-FDAFT処理用のデータバッチ準備
+    JamMa-FDAFT処理用のデータバッチ準備（修正版）
+    
+    Args:
+        image1, image2: 入力画像
+        use_masks: マスクを使用するかどうか（デモではFalseが安全）
     """
     # RGB形式に変換（3チャンネル）
     if len(image1.shape) == 2:
@@ -300,33 +419,78 @@ def prepare_data_batch(image1, image2):
             os.unlink(tmp1.name)
             os.unlink(tmp2.name)
     
-    # マスクサイズを修正（coarseレベル用）
-    coarse_scale = 0.125  # 1/8 scale
-    if mask1 is not None and mask2 is not None:
-        mask1_coarse = F.interpolate(
-            mask1.unsqueeze(0).float(), 
-            scale_factor=coarse_scale, 
-            mode='nearest'
-        ).squeeze(0).bool()
-        mask2_coarse = F.interpolate(
-            mask2.unsqueeze(0).float(), 
-            scale_factor=coarse_scale, 
-            mode='nearest'
-        ).squeeze(0).bool()
+    print(f"  📏 画像とマスクの初期サイズ:")
+    print(f"    image1_tensor: {image1_tensor.shape}")
+    print(f"    image2_tensor: {image2_tensor.shape}")
+    if mask1 is not None:
+        print(f"    mask1: {mask1.shape}")
+        print(f"    mask2: {mask2.shape}")
+    
+    # マスク処理
+    mask1_coarse = mask2_coarse = None
+    
+    if use_masks and mask1 is not None and mask2 is not None:
+        print("  📏 マスクを使用してcoarse処理を実行")
+        
+        # マスクサイズを修正（coarseレベル用）
+        coarse_scale = 0.125  # 1/8 scale
+        
+        # バッチサイズを1に設定してマスクを処理
+        B = 1  # バッチサイズ
+        
+        # マスクを正しい形状に整形: [B, H, W]
+        if mask1.dim() == 2:  # [H, W]
+            mask1 = mask1.unsqueeze(0)  # [1, H, W]
+        if mask2.dim() == 2:  # [H, W]
+            mask2 = mask2.unsqueeze(0)  # [1, H, W]
+        
+        # マスクを[B, 1, H, W]形式にして処理
+        mask_stack = torch.stack([mask1, mask2], dim=0).unsqueeze(1).float()  # [2, 1, H, W]
+        
+        # coarseスケールでリサイズ
+        mask_coarse = F.interpolate(
+            mask_stack,
+            scale_factor=coarse_scale,
+            mode='nearest',
+            recompute_scale_factor=False
+        ).squeeze(1).bool()  # [2, H_c, W_c]
+        
+        # バッチサイズが1なので、正しい次元を保持
+        mask1_coarse = mask_coarse[0].unsqueeze(0)  # [1, H_c, W_c] 
+        mask2_coarse = mask_coarse[1].unsqueeze(0)  # [1, H_c, W_c]
+        
+        print(f"    coarseマスクサイズ: {mask1_coarse.shape}, {mask2_coarse.shape}")
+        
+        # 確認: 正しい次元数になっているか
+        assert mask1_coarse.dim() == 3, f"mask1_coarse should be 3D, got {mask1_coarse.dim()}D"
+        assert mask2_coarse.dim() == 3, f"mask2_coarse should be 3D, got {mask2_coarse.dim()}D"
+        
     else:
+        print("  📏 マスクなしでデモを実行（より安全）")
         mask1_coarse = mask2_coarse = None
     
     # データ辞書作成
     data = {
         'imagec_0': image1_tensor,
         'imagec_1': image2_tensor,
-        'mask0': mask1_coarse,  # coarseレベルのマスク
-        'mask1': mask2_coarse,  # coarseレベルのマスク
         'dataset_name': ['JamMa-FDAFT-Demo'],
         'scene_id': 'demo_scene',
         'pair_id': 0,
         'pair_names': [('demo_image1.png', 'demo_image2.png')]
     }
+    
+    # マスクがある場合のみ追加
+    if mask1_coarse is not None:
+        data['mask0'] = mask1_coarse
+        data['mask1'] = mask2_coarse
+    
+    # デバッグ: 最終的なデータ形状を確認
+    print(f"  📏 最終データ形状:")
+    for key, value in data.items():
+        if isinstance(value, torch.Tensor):
+            print(f"    {key}: {value.shape}")
+        elif value is None:
+            print(f"    {key}: None")
     
     return data
 
@@ -438,9 +602,9 @@ def demonstrate_jamma_fdaft():
     start_time = time.time()
     
     try:
-        # データバッチ準備
+        # データバッチ準備（マスクなしで安全に実行）
         print("  📦 データバッチを準備中...")
-        data = prepare_data_batch(image1, image2)
+        data = prepare_data_batch(image1, image2, use_masks=False)
         
         # デバイスに移動
         for key, value in data.items():
