@@ -2,9 +2,9 @@
 修正されたJamMa-FDAFT Complete Demonstration Script
 
 主な修正点：
-- JamMaの学習済みモデルとの完全互換性を確保
-- demo/utils_fdaft.pyを使用したシンプルなインターフェース
-- 元のdemo/demo.pyと同様の使いやすさ
+- assetsフォルダの実際の画像を使用
+- src/demo/demo.pyと同様のインターフェース
+- コマンドライン引数で画像パスを指定可能
 """
 
 import os
@@ -15,6 +15,8 @@ import matplotlib.pyplot as plt
 import time
 import torch
 import torch.nn.functional as F
+import argparse
+from pathlib import Path
 
 # Add project root to path
 project_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
@@ -24,7 +26,8 @@ try:
     # JamMa-FDAFT用のユーティリティをインポート
     from demo.utils_fdaft import JamMa, cfg
     from src.utils.dataset import read_megadepth_color
-    from src.utils.plotting import make_matching_figures
+    from src.utils.plotting import make_matching_figures, make_confidence_figure, make_evaluation_figure_wheel
+    from loguru import logger
 except ImportError as e:
     print(f"Error importing modules: {e}")
     print("Please ensure the project is properly set up.")
@@ -33,105 +36,134 @@ except ImportError as e:
     sys.exit(1)
 
 
-def create_planetary_image_pair():
+def load_image_from_assets(image_path: str):
     """
-    惑星表面画像ペアの生成（改良版）
+    assetsフォルダから画像を読み込み
+    
+    Args:
+        image_path: 画像ファイルのパス
+        
+    Returns:
+        読み込まれた画像（numpy array）
     """
-    print("  Creating synthetic planetary surface images...")
-    np.random.seed(42)
-    size = (512, 512)
+    if not os.path.exists(image_path):
+        # assetsフォルダ内を検索
+        assets_path = os.path.join(project_root, 'assets', image_path)
+        if os.path.exists(assets_path):
+            image_path = assets_path
+        else:
+            # figsフォルダ内も検索
+            figs_path = os.path.join(project_root, 'assets', 'figs', image_path)
+            if os.path.exists(figs_path):
+                image_path = figs_path
+            else:
+                raise FileNotFoundError(f"Image not found: {image_path}")
     
-    # より現実的な地形生成
-    x, y = np.meshgrid(np.linspace(0, 10, size[1]), np.linspace(0, 10, size[0]))
+    print(f"Loading image from: {image_path}")
     
-    # 多スケール地形生成
-    terrain1 = (
-        np.sin(x) * np.cos(y) +                    # 大規模特徴
-        0.5 * np.sin(2*x) * np.cos(3*y) +         # 中規模特徴  
-        0.3 * np.sin(5*x) * np.cos(2*y) +         # 小規模特徴
-        0.2 * np.sin(8*x) * np.cos(5*y) +         # 細部
-        0.1 * np.random.normal(0, 1, size)        # ノイズ
-    )
+    # OpenCVで画像を読み込み
+    image = cv2.imread(image_path)
+    if image is None:
+        raise ValueError(f"Could not load image: {image_path}")
     
-    # クレーター様の円形窪地を追加
-    crater_positions = [
-        (128, 150, 25),  # (center_x, center_y, radius)
-        (300, 200, 35),
-        (400, 400, 20),
-        (150, 350, 30)
-    ]
+    # BGR to RGB
+    image = cv2.cvtColor(image, cv2.COLOR_BGR2RGB)
     
-    for cx, cy, radius in crater_positions:
-        y_coords, x_coords = np.ogrid[:size[0], :size[1]]
-        crater_mask = (x_coords - cx)**2 + (y_coords - cy)**2 <= radius**2
-        
-        # 現実的なクレータープロファイル
-        distance = np.sqrt((x_coords - cx)**2 + (y_coords - cy)**2)
-        crater_depth = np.exp(-distance**2 / (2 * (radius/2)**2)) * 0.4
-        
-        terrain1[crater_mask] -= crater_depth[crater_mask]
-    
-    # 2番目の画像（幾何変換適用）
-    center = (size[1]//2, size[0]//2)
-    angle = 12  # degrees
-    scale = 0.95
-    
-    M = cv2.getRotationMatrix2D(center, angle, scale)
-    M[0, 2] += 25  # translation x
-    M[1, 2] += 15  # translation y
-    
-    image2 = cv2.warpAffine(terrain1, M, (size[1], size[0]))
-    
-    # 照明変化をシミュレート
-    illumination_gradient_x = np.linspace(0.85, 1.15, size[1])
-    illumination_gradient_y = np.linspace(1.05, 0.95, size[0])
-    illumination_map = np.outer(illumination_gradient_y, illumination_gradient_x)
-    
-    image2 = image2 * illumination_map + 0.1
-    
-    # [0, 255]範囲に正規化
-    image1 = ((terrain1 - terrain1.min()) / (terrain1.max() - terrain1.min()) * 255).astype(np.uint8)
-    image2 = ((image2 - image2.min()) / (image2.max() - image2.min()) * 255).astype(np.uint8)
-    
-    print("  ✓ Synthetic planetary images created successfully!")
-    return image1, image2
+    return image, image_path
 
 
-def demonstrate_jamma_fdaft():
-    """メイン実演関数"""
-    print("JamMa-FDAFT統合パイプライン実演")
+def display_input_images(image1, image2, image1_path, image2_path):
+    """
+    入力画像を表示
+    
+    Args:
+        image1, image2: 入力画像
+        image1_path, image2_path: 画像のパス
+    """
+    print("\n入力画像を表示中...")
+    fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(15, 8))
+    
+    ax1.imshow(image1)
+    ax1.set_title(f'画像1: {os.path.basename(image1_path)}', fontsize=14, fontweight='bold')
+    ax1.axis('off')
+    
+    ax2.imshow(image2)
+    ax2.set_title(f'画像2: {os.path.basename(image2_path)}', fontsize=14, fontweight='bold')
+    ax2.axis('off')
+    
+    plt.tight_layout()
+    plt.show()
+
+
+def prepare_images_for_matching(image1_path: str, image2_path: str):
+    """
+    マッチング用に画像を準備
+    
+    Args:
+        image1_path, image2_path: 画像ファイルのパス
+        
+    Returns:
+        demo/demo.pyと同じ形式のデータ辞書
+    """
+    print(f"画像を準備中...")
+    print(f"  画像1: {image1_path}")
+    print(f"  画像2: {image2_path}")
+    
+    # demo/demo.pyと同様の方法でデータを準備
+    image0, scale0, mask0, prepad_size0 = read_megadepth_color(image1_path, 832, 16, True)
+    image1_tensor, scale1, mask1, prepad_size1 = read_megadepth_color(image2_path, 832, 16, True)
+    
+    # マスクの処理
+    if mask0 is not None:
+        mask0 = F.interpolate(mask0[None, None].float(), scale_factor=0.125, 
+                             mode='nearest', recompute_scale_factor=False)[0].bool()
+    if mask1 is not None:
+        mask1 = F.interpolate(mask1[None, None].float(), scale_factor=0.125, 
+                             mode='nearest', recompute_scale_factor=False)[0].bool()
+    
+    return image0, image1_tensor, mask0, mask1, scale0, scale1, prepad_size0, prepad_size1
+
+
+def demonstrate_jamma_fdaft_with_assets(image1_path: str, image2_path: str, output_dir: str = 'output/'):
+    """
+    assets画像を使用したJamMa-FDAFTデモ
+    
+    Args:
+        image1_path: 最初の画像のパス
+        image2_path: 2番目の画像のパス
+        output_dir: 出力ディレクトリ
+    """
+    print("JamMa-FDAFT統合パイプライン実演 (Assets Images)")
     print("=" * 60)
     print("アーキテクチャ: Input Images → FDAFT Encoder → Joint Mamba (JEGO) → C2F Matching")
     print("特徴: JamMaの学習済みモデルを使用")
     print()
     
-    # ステップ1: サンプル画像作成
-    print("Step 1: 合成惑星画像の作成...")
+    # 出力ディレクトリを作成
+    Path(output_dir).mkdir(exist_ok=True, parents=True)
+    
+    # ステップ1: 画像の読み込み
+    print("Step 1: Assets画像の読み込み...")
     start_time = time.time()
-    image1, image2 = create_planetary_image_pair()
-    creation_time = time.time() - start_time
-    print(f"  ✓ 画像作成完了 {creation_time:.2f} 秒")
     
-    # 入力画像表示
-    print("\n入力画像を表示中...")
-    fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(15, 6))
-    
-    ax1.imshow(image1, cmap='gray')
-    ax1.set_title('惑星画像1 (参照)', fontsize=14, fontweight='bold')
-    ax1.axis('off')
-    
-    ax2.imshow(image2, cmap='gray')
-    ax2.set_title('惑星画像2 (変換済み)', fontsize=14, fontweight='bold')
-    ax2.axis('off')
-    
-    plt.tight_layout()
-    plt.show()
+    try:
+        image1, image1_full_path = load_image_from_assets(image1_path)
+        image2, image2_full_path = load_image_from_assets(image2_path)
+        loading_time = time.time() - start_time
+        print(f"  ✓ 画像読み込み完了 {loading_time:.2f} 秒")
+        
+        # 入力画像表示
+        display_input_images(image1, image2, image1_full_path, image2_full_path)
+        
+    except Exception as e:
+        print(f"  ✗ 画像読み込みエラー: {e}")
+        return False
     
     # ステップ2: JamMa-FDAFT初期化
     print("\nStep 2: JamMa-FDAFT モデル初期化...")
     
-    print("  JamMa-FDAFT統合モデル初期化中...")
     device = 'cuda' if torch.cuda.is_available() else 'cpu'
+    print(f"  使用デバイス: {device}")
     
     # demo/utils_fdaft.pyを使用してモデルを初期化
     jamma_fdaft = JamMa(config=cfg).eval().to(device)
@@ -151,35 +183,22 @@ def demonstrate_jamma_fdaft():
     start_time = time.time()
     
     try:
-        # 画像をPILで一時的に保存してread_megadepth_colorで読み込み
-        from PIL import Image
-        import tempfile
+        # 画像の前処理とデータ準備
+        image0, image1_tensor, mask0, mask1, scale0, scale1, prepad_size0, prepad_size1 = prepare_images_for_matching(
+            image1_full_path, image2_full_path
+        )
         
-        with tempfile.NamedTemporaryFile(suffix='.png', delete=False) as tmp1, \
-             tempfile.NamedTemporaryFile(suffix='.png', delete=False) as tmp2:
-            
-            Image.fromarray(image1).save(tmp1.name)
-            Image.fromarray(image2).save(tmp2.name)
-            
-            # demo/demo.pyと同様の方法でデータを準備
-            image0, scale0, mask0, prepad_size0 = read_megadepth_color(tmp1.name, 832, 16, True)
-            image1_tensor, scale1, mask1, prepad_size1 = read_megadepth_color(tmp2.name, 832, 16, True)
-            
-            # マスクの処理
-            mask0 = F.interpolate(mask0[None, None].float(), scale_factor=0.125, mode='nearest', recompute_scale_factor=False)[0].bool()
-            mask1 = F.interpolate(mask1[None, None].float(), scale_factor=0.125, mode='nearest', recompute_scale_factor=False)[0].bool()
-            
-            # データ辞書を作成（demo/demo.pyと同じ形式）
-            data = {
-                'imagec_0': image0.to(device),
-                'imagec_1': image1_tensor.to(device),
-                'mask0': mask0.to(device),
-                'mask1': mask1.to(device),
-            }
-            
-            # 一時ファイルを削除
-            os.unlink(tmp1.name)
-            os.unlink(tmp2.name)
+        # データ辞書を作成（demo/demo.pyと同じ形式）
+        data = {
+            'imagec_0': image0.to(device),
+            'imagec_1': image1_tensor.to(device),
+        }
+        
+        # マスクがある場合は追加
+        if mask0 is not None:
+            data['mask0'] = mask0.to(device)
+        if mask1 is not None:
+            data['mask1'] = mask1.to(device)
         
         with torch.no_grad():
             print("  FDAFT + JamMa統合処理中...")
@@ -205,13 +224,33 @@ def demonstrate_jamma_fdaft():
     print(f"  粗レベルマッチ検出: {coarse_matches}")
     print(f"  細レベルマッチ検出: {num_matches}")
     
-    # ステップ5: 結果可視化
-    print(f"\nStep 5: 結果可視化...")
+    # ステップ5: 結果可視化と保存
+    print(f"\nStep 5: 結果可視化と保存...")
     try:
         if num_matches > 0:
-            # マッチング可視化作成
-            make_matching_figures(data, mode='evaluation')
-            print("  ✓ 可視化完了")
+            # マッチング可視化を複数のスタイルで作成
+            print("  信頼度ベース可視化を作成中...")
+            make_confidence_figure(data, path=os.path.join(output_dir, 'confidence_matches.png'), dpi=300, topk=4000)
+            
+            print("  評価ベース可視化を作成中...")
+            make_evaluation_figure_wheel(data, path=os.path.join(output_dir, 'evaluation_matches.png'), topk=4000)
+            
+            print(f"  ✓ 可視化完了 - 結果は {output_dir} に保存されました")
+            
+            # 簡単な統計情報を保存
+            stats_file = os.path.join(output_dir, 'matching_stats.txt')
+            with open(stats_file, 'w') as f:
+                f.write(f"JamMa-FDAFT Matching Results\n")
+                f.write(f"============================\n\n")
+                f.write(f"Image 1: {os.path.basename(image1_full_path)}\n")
+                f.write(f"Image 2: {os.path.basename(image2_full_path)}\n")
+                f.write(f"Processing Time: {processing_time:.2f} seconds\n")
+                f.write(f"Coarse Matches: {coarse_matches}\n")
+                f.write(f"Fine Matches: {num_matches}\n")
+                f.write(f"Device: {device}\n")
+            
+            print(f"  統計情報を {stats_file} に保存しました")
+            
         else:
             print("  ⚠ 可視化用マッチなし")
             
@@ -222,47 +261,82 @@ def demonstrate_jamma_fdaft():
     print("\n" + "="*60)
     print("JAMMA-FDAFT 実演まとめ")
     print("="*60)
+    print(f"使用画像:")
+    print(f"  - {os.path.basename(image1_full_path)}")
+    print(f"  - {os.path.basename(image2_full_path)}")
     print(f"処理時間: {processing_time:.2f} 秒")
     print(f"最終マッチ数: {num_matches}")
+    print(f"出力ディレクトリ: {output_dir}")
     
     if num_matches >= 8:
-        print("✓ 成功: JamMa-FDAFTが惑星画像のマッチングに成功!")
+        print("✓ 成功: JamMa-FDAFTが画像のマッチングに成功!")
         print("  統合パイプラインが実証:")
-        print("  - FDAFT: 弱い表面テクスチャ用の堅牢な特徴抽出")
+        print("  - FDAFT: 堅牢な特徴抽出")
         print("  - JamMa学習済み: 効率的な長距離特徴相互作用")
         print("  - C2F マッチング: 階層的マッチングとサブピクセル精細化")
-        print("  - 惑星最適化: 困難な表面での性能向上")
     else:
         print("⚠ 限定的成功: 少数のマッチのみ検出")
-        print("  原因として考えられるもの:")
-        print("  - デモ用モデルサイズの縮小（完全モデルでより良い結果）")
-        print("  - 合成画像の特性が困難")
-        print("  - 特定画像タイプ用のパラメータ調整の必要性")
+        print("  考えられる原因:")
+        print("  - 画像間の視点変化が大きい")
+        print("  - テクスチャが少ない")
+        print("  - 照明条件の違い")
     
     print(f"\n次のステップ:")
-    print(f"  - 実際の惑星データセット（火星、月など）での訓練")
-    print(f"  - 実行: python train_jammf.py configs/data/megadepth_trainval_832.py configs/jamma_fdaft/outdoor/final.py")
-    print(f"  - テスト: python test_jammf.py configs/data/megadepth_test_1500.py configs/jamma_fdaft/outdoor/test.py")
+    print(f"  - より多くの画像ペアでテスト")
+    print(f"  - 実際のデータセットでの訓練")
+    print(f"  - パラメータの調整")
     
     return True
 
 
-if __name__ == "__main__":
-    """実演スクリプトのエントリーポイント"""
+def main():
+    """メイン関数"""
+    parser = argparse.ArgumentParser(
+        description='JamMa-FDAFT Image Matching Demo with Assets Images',
+        formatter_class=argparse.ArgumentDefaultsHelpFormatter
+    )
+    parser.add_argument(
+        '--image1', type=str, 
+        default='figs/345822933_b5fb7b6feb_o.jpg',
+        help='Path to the first image (relative to assets/ or absolute path)'
+    )
+    parser.add_argument(
+        '--image2', type=str, 
+        default='figs/479605349_8aa68e066d_o.jpg',
+        help='Path to the second image (relative to assets/ or absolute path)'
+    )
+    parser.add_argument(
+        '--output_dir', type=str, default='output/',
+        help='Directory to save output visualizations'
+    )
+    
+    args = parser.parse_args()
+    
+    print("JamMa-FDAFT Assets Image Demo")
+    print("============================")
+    print(f"Image 1: {args.image1}")
+    print(f"Image 2: {args.image2}")
+    print(f"Output: {args.output_dir}")
+    print()
+    
     try:
         # matplotlib設定
         try:
             import matplotlib
-            matplotlib.use('TkAgg')
+            matplotlib.use('TkAgg')  # インタラクティブ表示
         except:
-            matplotlib.use('Agg')
+            matplotlib.use('Agg')    # 非対話的表示
             print("注意: 非対話型matplotlibバックエンドを使用")
         
-        success = demonstrate_jamma_fdaft()
+        success = demonstrate_jamma_fdaft_with_assets(
+            args.image1, 
+            args.image2, 
+            args.output_dir
+        )
         
         if success:
             print(f"\n🎉 JamMa-FDAFT デモが正常に完了しました!")
-            input("Enterキーで終了...")
+            print(f"結果は {args.output_dir} ディレクトリを確認してください。")
         else:
             print(f"\n❌ デモが失敗しました。上記のエラーメッセージを確認してください。")
             
@@ -272,5 +346,7 @@ if __name__ == "__main__":
         print(f"\n❌ 予期しないエラー: {e}")
         import traceback
         traceback.print_exc()
-        
-    sys.exit(0)
+
+
+if __name__ == "__main__":
+    main()
